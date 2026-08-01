@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument(
         "--reason",
         choices=[reason.value for reason in BackupReason],
-        default=BackupReason.MANUAL.value,
+        default=BackupReason.OPERATOR.value,
     )
     subparsers.add_parser("prune")
     subparsers.add_parser("query-players")

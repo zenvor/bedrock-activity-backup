@@ -27,6 +27,8 @@
 - 默认日志不输出 Gamertag、XUID 或原始连接日志。
 - BDS 必须由附带的 FIFO 包装器启动，才能安全接收管理命令。
 
+`backup` 子命令创建的是 operator 快照，仍位于自动目录并参与 4 份轮换；升级、加模组等需要长期保留的人工里程碑必须放在自动目录之外。
+
 ## 开发
 
 项目只依赖 Python 3.10+ 标准库；集成运行时还需要 Linux、systemd、`journalctl` 和支持 `--link-dest`、`--chown` 的 rsync。

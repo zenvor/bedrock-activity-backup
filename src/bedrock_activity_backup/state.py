@@ -18,7 +18,7 @@ class BackupReason(str, Enum):
     PERIODIC = "periodic"
     LAST_PLAYER_LEFT = "last-player-left"
     RECOVERY = "recovery"
-    MANUAL = "manual"
+    OPERATOR = "operator"
 
 
 @dataclass
