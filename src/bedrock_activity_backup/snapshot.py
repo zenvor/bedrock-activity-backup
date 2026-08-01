@@ -283,14 +283,8 @@ class SnapshotRotator:
             if isinstance(previous, str) and previous in names:
                 referenced.add(previous)
         heads = [path for path in complete if path.name not in referenced]
-        latest = self.config.backup_root / "latest"
-        if latest.is_symlink():
-            try:
-                current = latest.resolve(strict=True)
-                if current in heads:
-                    return current
-            except OSError:
-                pass
+        if len(heads) == 1:
+            return heads[0]
         return max(heads or complete, key=lambda path: path.name)
 
     def _newest_first(self, complete: list[Path]) -> list[Path]:
