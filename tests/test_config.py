@@ -54,6 +54,58 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "between 2 and 20"):
                 invalid.validate()
 
+    def test_loaded_config_must_match_managed_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "bds_root": "/srv/bds",
+                        "world_name": "World",
+                        "bds_service": "bds.service",
+                        "console_fifo": "/run/bds/console",
+                        "state_file": "/run/bds/state.json",
+                        "backup_root": "/srv/backups",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "managed-v1"):
+                Config.load(path)
+
+    def test_world_name_rejects_rsync_filter_metacharacters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(Path(directory))
+            invalid = Config(**{**config.__dict__, "world_name": "World[old]"})
+            with self.assertRaisesRegex(ValueError, "rsync filter"):
+                invalid.validate(require_managed_layout=False)
+
+    def test_backup_and_world_paths_must_not_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(Path(directory))
+            invalid = Config(
+                **{
+                    **config.__dict__,
+                    "backup_root": config.world_path / "backups",
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "must not overlap"):
+                invalid.validate(require_managed_layout=False)
+
+    def test_console_timeouts_must_fit_systemd_stop_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(Path(directory))
+            invalid = Config(
+                **{
+                    **config.__dict__,
+                    "ready_timeout_seconds": 100,
+                    "resume_timeout_seconds": 20,
+                    "list_timeout_seconds": 20,
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "stop-time budget"):
+                invalid.validate(require_managed_layout=False)
+
 
 if __name__ == "__main__":
     unittest.main()

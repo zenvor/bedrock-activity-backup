@@ -60,6 +60,16 @@ class ActivityStateTests(unittest.TestCase):
         state.backup_failed(3000, 300)
         self.assertEqual(state.phase, Phase.ACTIVE)
         self.assertEqual(state.next_due_epoch, 3300)
+        self.assertEqual(state.retry_reason, BackupReason.PERIODIC)
+        self.assertEqual(state.timer_due(3300), BackupReason.PERIODIC)
+
+    def test_failed_final_retry_preserves_final_reason(self):
+        state = ActivityState(
+            Phase.BACKING_UP, pending_reason=BackupReason.LAST_PLAYER_LEFT
+        )
+        state.backup_failed(3000, 300)
+        self.assertEqual(state.retry_reason, BackupReason.LAST_PLAYER_LEFT)
+        self.assertEqual(state.timer_due(3300), BackupReason.LAST_PLAYER_LEFT)
 
     def test_restart_preserves_future_deadline(self):
         state = ActivityState(Phase.ACTIVE, 2800)
@@ -73,10 +83,12 @@ class ActivityStateTests(unittest.TestCase):
         )
         self.assertEqual(state.phase, Phase.BACKING_UP)
 
-    def test_force_final_backup_covers_disconnect_during_periodic_copy(self):
-        state = ActivityState()
-        self.assertEqual(state.force_final_backup(), BackupReason.LAST_PLAYER_LEFT)
-        self.assertEqual(state.phase, Phase.BACKING_UP)
+    def test_periodic_completion_can_persist_final_requirement(self):
+        state = ActivityState(Phase.BACKING_UP, pending_reason=BackupReason.PERIODIC)
+        self.assertEqual(
+            state.require_final_backup(), BackupReason.LAST_PLAYER_LEFT
+        )
+        self.assertEqual(state.pending_reason, BackupReason.LAST_PLAYER_LEFT)
 
 
 class StateStoreTests(unittest.TestCase):
@@ -96,6 +108,18 @@ class StateStoreTests(unittest.TestCase):
             path.write_text(json.dumps({"version": 99}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "invalid"):
                 StateStore(path).load()
+
+    def test_version_one_state_is_migrated(self):
+        raw = {
+            "version": 1,
+            "phase": "active",
+            "next_due_epoch": 2800,
+            "pending_reason": None,
+        }
+        state = ActivityState.from_dict(raw)
+        self.assertEqual(state.phase, Phase.ACTIVE)
+        self.assertIsNone(state.retry_reason)
+        self.assertEqual(state.to_dict()["version"], 2)
 
 
 if __name__ == "__main__":

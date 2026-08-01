@@ -33,6 +33,7 @@ done
 python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'
 rsync --help | grep -q -- '--link-dest'
 rsync --help | grep -q -- '--chown'
+rsync --help | grep -q -- '--fsync'
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -42,6 +43,7 @@ backup="$install_root/install-backups/$timestamp"
 current_link="$install_root/current"
 bds_was_active=0
 watcher_was_enabled=0
+watcher_was_active=0
 restart_attempted=0
 
 if systemctl is-active --quiet minecraft-bedrock.service; then
@@ -49,6 +51,9 @@ if systemctl is-active --quiet minecraft-bedrock.service; then
 fi
 if systemctl is-enabled --quiet bedrock-activity-backup.service 2>/dev/null; then
   watcher_was_enabled=1
+fi
+if systemctl is-active --quiet bedrock-activity-backup.service 2>/dev/null; then
+  watcher_was_active=1
 fi
 
 targets=(
@@ -95,41 +100,67 @@ fi
 rollback() {
   status=$?
   trap - ERR
+  rollback_ok=1
   echo "Installation failed; restoring the previous integration files" >&2
   if ((restart_attempted == 1)); then
-    systemctl stop bedrock-activity-backup.service || true
-    systemctl stop minecraft-bedrock.service || true
+    if ! systemctl stop bedrock-activity-backup.service; then rollback_ok=0; fi
+    if ! systemctl stop minecraft-bedrock.service; then rollback_ok=0; fi
   fi
   for index in "${!targets[@]}"; do
     target="${targets[$index]}"
     backup_name="${backup_names[$index]}"
     if [[ -e "$backup/$backup_name" || -L "$backup/$backup_name" ]]; then
-      rm -f -- "$target"
-      cp -a "$backup/$backup_name" "$target"
+      if ! rm -f -- "$target"; then rollback_ok=0; fi
+      if ! cp -a "$backup/$backup_name" "$target"; then rollback_ok=0; fi
     elif [[ -f "$backup/.absent-$backup_name" ]]; then
-      rm -f -- "$target"
+      if ! rm -f -- "$target"; then rollback_ok=0; fi
     fi
   done
   if [[ -f "$backup/current-link-target" ]]; then
     previous_current="$(<"$backup/current-link-target")"
-    ln -sfn "$previous_current" "$current_link"
+    if ! ln -sfn "$previous_current" "$current_link"; then rollback_ok=0; fi
   elif [[ -f "$backup/.absent-current-link" ]]; then
-    rm -f -- "$current_link"
+    if ! rm -f -- "$current_link"; then rollback_ok=0; fi
   fi
-  systemctl daemon-reload || true
+  if ! systemctl daemon-reload; then rollback_ok=0; fi
   if ((watcher_was_enabled == 1)); then
-    systemctl enable bedrock-activity-backup.service || true
+    if ! systemctl enable bedrock-activity-backup.service; then rollback_ok=0; fi
   else
-    systemctl disable bedrock-activity-backup.service || true
+    systemctl disable bedrock-activity-backup.service >/dev/null 2>&1 || :
   fi
-  if ((restart_attempted == 1 && bds_was_active == 1)); then
-    systemctl start minecraft-bedrock.service || true
+  if ((bds_was_active == 1)); then
+    if ! systemctl start minecraft-bedrock.service; then rollback_ok=0; fi
+  elif systemctl is-active --quiet minecraft-bedrock.service; then
+    if ! systemctl stop minecraft-bedrock.service; then rollback_ok=0; fi
+  fi
+  if ((watcher_was_active == 1)); then
+    if ! systemctl start bedrock-activity-backup.service; then rollback_ok=0; fi
+  elif systemctl is-active --quiet bedrock-activity-backup.service; then
+    if ! systemctl stop bedrock-activity-backup.service; then rollback_ok=0; fi
+  fi
+  actual_bds_active=0
+  actual_watcher_active=0
+  actual_watcher_enabled=0
+  if systemctl is-active --quiet minecraft-bedrock.service; then actual_bds_active=1; fi
+  if systemctl is-active --quiet bedrock-activity-backup.service; then actual_watcher_active=1; fi
+  if systemctl is-enabled --quiet bedrock-activity-backup.service 2>/dev/null; then actual_watcher_enabled=1; fi
+  if ((
+    actual_bds_active != bds_was_active
+    || actual_watcher_active != watcher_was_active
+    || actual_watcher_enabled != watcher_was_enabled
+  )); then
+    rollback_ok=0
+  fi
+  if ((rollback_ok == 0)); then
+    echo "Rollback verification failed; manual service recovery is required" >&2
   fi
   exit "$status"
 }
 trap rollback ERR
 
 install -d -m 0750 -o root -g root /etc/bedrock-activity-backup
+install -d -m 0700 -o root -g root /var/lib/bedrock-activity-backup
+install -d -m 0700 -o root -g root /var/lib/bedrock-activity-backup/rehearsals
 install -d -m 0755 -o root -g root /etc/systemd/system/minecraft-bedrock.service.d
 install -m 0755 -o root -g root "$project_root/bin/bedrock-activity-backup" /usr/local/sbin/bedrock-activity-backup
 install -m 0755 -o root -g root "$project_root/scripts/minecraft-bedrock-run" /usr/local/sbin/minecraft-bedrock-run

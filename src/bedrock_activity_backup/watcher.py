@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from .config import Config
 from .console import BdsConsole
+from .errors import safe_error_label
 from .snapshot import SnapshotManager
 from .state import ActivityState, BackupReason, Phase, StateStore
 
@@ -94,8 +95,6 @@ class ActivityWatcher:
         self.monotonic = monotonic
         self.sleep = sleep
         self.stopping = False
-        self.last_backup_started_monotonic: float | None = None
-        self.last_backup_reason: BackupReason | None = None
 
     def stop(self, _signum=None, _frame=None) -> None:
         self.stopping = True
@@ -106,7 +105,13 @@ class ActivityWatcher:
         signal.signal(signal.SIGINT, self.stop)
         self.follower.start()
         try:
-            self.snapshots.rotator.prune()
+            try:
+                self.snapshots.maintain()
+            except Exception as error:
+                LOGGER.error(
+                    "Snapshot repository maintenance failed (%s); continuing",
+                    safe_error_label(error),
+                )
             try:
                 state = self.store.load()
             except ValueError:
@@ -155,16 +160,6 @@ class ActivityWatcher:
                     self.sleep(0.25)
                     online = self._query_players_with_retry(15)
                     reason = state.player_disconnected(online)
-                    if (
-                        reason is None
-                        and online == 0
-                        and state.phase is Phase.IDLE
-                        and self.last_backup_reason is BackupReason.PERIODIC
-                        and self.last_backup_started_monotonic is not None
-                        and event.observed_monotonic
-                        >= self.last_backup_started_monotonic
-                    ):
-                        reason = state.force_final_backup()
                     if reason is not None:
                         self.store.save(state)
                         LOGGER.info(
@@ -175,28 +170,37 @@ class ActivityWatcher:
             self.follower.close()
 
     def _perform_backup(self, state: ActivityState, reason: BackupReason) -> None:
-        self.last_backup_started_monotonic = self.monotonic()
-        self.last_backup_reason = reason
         try:
             path = self.snapshots.create(reason)
-        except Exception:
+        except Exception as error:
             state.backup_failed(self.wall_clock(), self.config.retry_seconds)
             self.store.save(state)
-            LOGGER.exception("Snapshot failed; retry scheduled")
+            LOGGER.error(
+                "Snapshot failed (%s); retry scheduled", safe_error_label(error)
+            )
             return
 
         try:
             online = self._query_players_with_retry(15)
-        except Exception:
+        except Exception as error:
             online = 1
-            LOGGER.exception(
-                "Snapshot succeeded but player query failed; keeping cycle active"
+            LOGGER.error(
+                "Snapshot succeeded but player query failed (%s); keeping cycle active",
+                safe_error_label(error),
             )
+        LOGGER.info("Snapshot completed successfully: %s", path.name)
+        if reason is BackupReason.PERIODIC and online == 0:
+            final_reason = state.require_final_backup()
+            self.store.save(state)
+            LOGGER.info(
+                "Periodic snapshot ended with no players; creating a persisted final snapshot"
+            )
+            self._perform_backup(state, final_reason)
+            return
         state.backup_succeeded(
             self.wall_clock(), online, self.config.interval_seconds
         )
         self.store.save(state)
-        LOGGER.info("Snapshot completed successfully: %s", path.name)
         if state.phase is Phase.ACTIVE:
             LOGGER.info(
                 "Players remain online; next backup scheduled in %d seconds",

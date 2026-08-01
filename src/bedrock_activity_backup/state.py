@@ -26,6 +26,7 @@ class ActivityState:
     phase: Phase = Phase.IDLE
     next_due_epoch: float | None = None
     pending_reason: BackupReason | None = None
+    retry_reason: BackupReason | None = None
 
     def player_connected(self, now: float, interval_seconds: int) -> bool:
         if self.phase is not Phase.IDLE:
@@ -33,6 +34,7 @@ class ActivityState:
         self.phase = Phase.ACTIVE
         self.next_due_epoch = now + interval_seconds
         self.pending_reason = None
+        self.retry_reason = None
         return True
 
     def player_disconnected(self, online_count: int) -> BackupReason | None:
@@ -43,14 +45,14 @@ class ActivityState:
         self.phase = Phase.BACKING_UP
         self.next_due_epoch = None
         self.pending_reason = BackupReason.LAST_PLAYER_LEFT
+        self.retry_reason = None
         return self.pending_reason
 
-    def force_final_backup(self) -> BackupReason:
-        if self.phase is not Phase.IDLE:
-            raise RuntimeError("force_final_backup requires idle state")
-        self.phase = Phase.BACKING_UP
-        self.next_due_epoch = None
+    def require_final_backup(self) -> BackupReason:
+        if self.phase is not Phase.BACKING_UP:
+            raise RuntimeError("require_final_backup requires backing_up state")
         self.pending_reason = BackupReason.LAST_PLAYER_LEFT
+        self.retry_reason = None
         return self.pending_reason
 
     def timer_due(self, now: float) -> BackupReason | None:
@@ -60,7 +62,8 @@ class ActivityState:
             return None
         self.phase = Phase.BACKING_UP
         self.next_due_epoch = None
-        self.pending_reason = BackupReason.PERIODIC
+        self.pending_reason = self.retry_reason or BackupReason.PERIODIC
+        self.retry_reason = None
         return self.pending_reason
 
     def reconcile_startup(
@@ -70,27 +73,32 @@ class ActivityState:
             raise ValueError("online_count must not be negative")
         if self.phase is Phase.BACKING_UP:
             self.pending_reason = BackupReason.RECOVERY
+            self.retry_reason = None
             return self.pending_reason
         if online_count == 0:
             if self.phase is Phase.ACTIVE:
                 self.phase = Phase.BACKING_UP
                 self.next_due_epoch = None
                 self.pending_reason = BackupReason.RECOVERY
+                self.retry_reason = None
                 return self.pending_reason
             self.phase = Phase.IDLE
             self.next_due_epoch = None
             self.pending_reason = None
+            self.retry_reason = None
             return None
         if self.phase is Phase.ACTIVE and self.next_due_epoch is not None:
             if self.next_due_epoch <= now:
                 self.phase = Phase.BACKING_UP
                 self.next_due_epoch = None
                 self.pending_reason = BackupReason.RECOVERY
+                self.retry_reason = None
                 return self.pending_reason
             return None
         self.phase = Phase.ACTIVE
         self.next_due_epoch = now + interval_seconds
         self.pending_reason = None
+        self.retry_reason = None
         return None
 
     def backup_succeeded(
@@ -99,6 +107,7 @@ class ActivityState:
         if self.phase is not Phase.BACKING_UP:
             raise RuntimeError("backup_succeeded requires backing_up state")
         self.pending_reason = None
+        self.retry_reason = None
         if online_count > 0:
             self.phase = Phase.ACTIVE
             self.next_due_epoch = now + interval_seconds
@@ -109,9 +118,11 @@ class ActivityState:
     def backup_failed(self, now: float, retry_seconds: int) -> None:
         if self.phase is not Phase.BACKING_UP:
             raise RuntimeError("backup_failed requires backing_up state")
+        reason = self.pending_reason or BackupReason.RECOVERY
         self.phase = Phase.ACTIVE
         self.next_due_epoch = now + retry_seconds
         self.pending_reason = None
+        self.retry_reason = reason
 
     def to_dict(self) -> dict[str, object]:
         result = asdict(self)
@@ -119,11 +130,14 @@ class ActivityState:
         result["pending_reason"] = (
             self.pending_reason.value if self.pending_reason is not None else None
         )
-        return {"version": 1, **result}
+        result["retry_reason"] = (
+            self.retry_reason.value if self.retry_reason is not None else None
+        )
+        return {"version": 2, **result}
 
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> "ActivityState":
-        if raw.get("version") != 1:
+        if raw.get("version") not in {1, 2}:
             raise ValueError("unsupported state version")
         phase = Phase(str(raw["phase"]))
         due = raw.get("next_due_epoch")
@@ -131,13 +145,26 @@ class ActivityState:
             raise ValueError("invalid next_due_epoch")
         pending = raw.get("pending_reason")
         reason = BackupReason(str(pending)) if pending is not None else None
-        state = cls(phase=phase, next_due_epoch=due, pending_reason=reason)
-        if phase is Phase.IDLE and (due is not None or reason is not None):
+        retry_raw = raw.get("retry_reason")
+        retry = BackupReason(str(retry_raw)) if retry_raw is not None else None
+        state = cls(
+            phase=phase,
+            next_due_epoch=due,
+            pending_reason=reason,
+            retry_reason=retry,
+        )
+        if phase is Phase.IDLE and (
+            due is not None or reason is not None or retry is not None
+        ):
             raise ValueError("idle state has pending work")
         if phase is Phase.ACTIVE and due is None:
             raise ValueError("active state has no deadline")
+        if phase is Phase.ACTIVE and reason is not None:
+            raise ValueError("active state has in-progress work")
         if phase is Phase.BACKING_UP and reason is None:
             raise ValueError("backing_up state has no reason")
+        if phase is Phase.BACKING_UP and retry is not None:
+            raise ValueError("backing_up state has retry work")
         return state
 
 
@@ -167,8 +194,8 @@ class StateStore:
                 json.dump(state.to_dict(), handle, sort_keys=True)
                 handle.write("\n")
                 handle.flush()
+                temporary.chmod(0o600)
                 os.fsync(handle.fileno())
-            temporary.chmod(0o600)
             os.replace(temporary, self.path)
             parent_descriptor = os.open(self.path.parent, os.O_RDONLY)
             try:
