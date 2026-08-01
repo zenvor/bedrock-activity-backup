@@ -1,0 +1,31 @@
+[Unit]
+Description=Create Minecraft Bedrock snapshots from player activity
+Requires=minecraft-bedrock.service
+After=minecraft-bedrock.service
+PartOf=minecraft-bedrock.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/bedrock-activity-backup --config /etc/bedrock-activity-backup/config.json watch
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=330
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+UMask=0027
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=true
+ReadWritePaths=/opt/minecraft-bedrock/backups /run/minecraft-bedrock
+
+[Install]
+WantedBy=multi-user.target

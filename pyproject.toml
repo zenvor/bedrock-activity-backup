@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bedrock-activity-backup"
+version = "0.1.0"
+description = "Event-driven, online-consistent snapshots for Minecraft Bedrock Dedicated Server"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+bedrock-activity-backup = "bedrock_activity_backup.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

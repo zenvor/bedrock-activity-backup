@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+console_fifo="${BDS_CONSOLE_FIFO:-/run/minecraft-bedrock/console}"
+umask 007
+
+if [[ -e "$console_fifo" && ! -p "$console_fifo" ]]; then
+  echo "Refusing to replace a non-FIFO console path" >&2
+  exit 1
+fi
+
+rm -f -- "$console_fifo"
+mkfifo -m 0620 "$console_fifo"
+
+# Keep one write descriptor open so short-lived administrative writers cannot
+# send EOF to the BDS console when they disconnect.
+exec 3<>"$console_fifo"
+exec /opt/minecraft-bedrock/bedrock_server <"$console_fifo"

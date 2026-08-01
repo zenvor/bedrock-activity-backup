@@ -1,0 +1,15 @@
+{
+  "bds_root": "/opt/minecraft-bedrock",
+  "world_name": "RLCraft World",
+  "bds_service": "minecraft-bedrock.service",
+  "console_fifo": "/run/minecraft-bedrock/console",
+  "state_file": "/run/minecraft-bedrock/activity-backup-state.json",
+  "backup_root": "/opt/minecraft-bedrock/backups/automatic",
+  "interval_seconds": 1800,
+  "retry_seconds": 300,
+  "keep_snapshots": 4,
+  "min_free_bytes": 5368709120,
+  "ready_timeout_seconds": 30,
+  "resume_timeout_seconds": 10,
+  "list_timeout_seconds": 8
+}
