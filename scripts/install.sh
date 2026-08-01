@@ -96,6 +96,10 @@ rollback() {
   status=$?
   trap - ERR
   echo "Installation failed; restoring the previous integration files" >&2
+  if ((restart_attempted == 1)); then
+    systemctl stop bedrock-activity-backup.service || true
+    systemctl stop minecraft-bedrock.service || true
+  fi
   for index in "${!targets[@]}"; do
     target="${targets[$index]}"
     backup_name="${backup_names[$index]}"
@@ -119,7 +123,7 @@ rollback() {
     systemctl disable bedrock-activity-backup.service || true
   fi
   if ((restart_attempted == 1 && bds_was_active == 1)); then
-    systemctl restart minecraft-bedrock.service || true
+    systemctl start minecraft-bedrock.service || true
   fi
   exit "$status"
 }
@@ -144,11 +148,13 @@ systemctl enable bedrock-activity-backup.service
 
 if ((restart == 1)); then
   restart_attempted=1
-  restart_since="$(date --iso-8601=seconds)"
+  restart_cursor="$(journalctl -u minecraft-bedrock.service -n 0 --show-cursor --no-pager \
+    | sed -n 's/^-- cursor: //p' | tail -n 1)"
+  [[ -n "$restart_cursor" ]]
   systemctl restart minecraft-bedrock.service
   server_started=0
   for _ in $(seq 1 60); do
-    if journalctl -u minecraft-bedrock.service --since "$restart_since" --no-pager \
+    if journalctl -u minecraft-bedrock.service --after-cursor "$restart_cursor" --no-pager \
         | grep -Fq "Server started."; then
       server_started=1
       break
