@@ -98,9 +98,9 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                         try:
                             manifest = rotator.verifier.manifest(candidate)
-                            state = manifest.get("snapshot_state")
-                            if state in {"pending", "failed"}:
-                                snapshot_states[state].append(candidate.name)
+                            snapshot_state = manifest.get("snapshot_state")
+                            if snapshot_state in {"pending", "failed"}:
+                                snapshot_states[snapshot_state].append(candidate.name)
                             elif candidate.name not in complete:
                                 snapshot_states["protected_legacy"].append(candidate.name)
                         except (OSError, RuntimeError, UnicodeError, ValueError):
