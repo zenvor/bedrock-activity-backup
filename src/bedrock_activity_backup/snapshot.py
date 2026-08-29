@@ -9,9 +9,11 @@ import logging
 import os
 import re
 import secrets
+import select
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path, PurePosixPath
 
@@ -23,11 +25,165 @@ from .state import BackupReason
 
 LOGGER = logging.getLogger(__name__)
 TOOL_ID = "bedrock-activity-backup"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SNAPSHOT_METHOD = "bds-save-hold-rsync-link-dest"
 _SNAPSHOT_PATTERN = re.compile(r"^\d{8}T\d{6}Z-[a-f0-9]{8}$")
 _MANIFEST_PATTERN = re.compile(r"^MANIFEST-\d+$")
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
+_SNAPSHOT_STATES = frozenset({"pending", "verified", "failed"})
+_LEVELDB_FAILURE_PATTERN = re.compile(
+    r"(?:leveldb.*(?:corruption|repair)|(?:corruption|repair).*leveldb|"
+    r"(?:missing|not found).{0,80}\.ldb|\.ldb.{0,80}(?:missing|not found))",
+    re.IGNORECASE,
+)
+
+
+class SnapshotValidationFailed(RuntimeError):
+    """A durable snapshot failed isolated LevelDB recovery validation."""
+
+    def __init__(
+        self, snapshot: Path, cause: Exception, details: dict[str, object] | None = None
+    ):
+        super().__init__("isolated snapshot validation failed")
+        self.snapshot = snapshot
+        self.cause = cause
+        self.details = details
+
+
+class IsolatedBdsValidator:
+    """Boot a copied snapshot with BDS away from the production world.
+
+    BDS is the LevelDB reader of record.  A successful process start is insufficient:
+    repair, corruption, and missing-ldb log signatures are hard failures.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        self.config = config
+        self._popen = popen
+        self._monotonic = monotonic
+        self._sleep = sleep
+
+    def verify(self, snapshot: Path) -> dict[str, object]:
+        stage = Path(
+            tempfile.mkdtemp(prefix=f".verify-{snapshot.name}-", dir=self.config.backup_root)
+        )
+        transcript: list[str] = []
+        process: subprocess.Popen[str] | None = None
+        try:
+            self._copy_runtime(stage, snapshot)
+            binary = stage / "bedrock_server"
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                raise RuntimeError("isolated BDS executable is unavailable")
+            process = self._popen(
+                [str(binary)],
+                cwd=stage,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            if process.stdout is None:
+                raise RuntimeError("isolated BDS has no log stream")
+            deadline = self._monotonic() + self.config.verification_timeout_seconds
+            startup_grace_deadline: float | None = None
+            while self._monotonic() < deadline:
+                ready, _unused, _errors = select.select([process.stdout], [], [], 0.1)
+                line = process.stdout.readline() if ready else ""
+                if line:
+                    transcript.append(line.rstrip())
+                    if _LEVELDB_FAILURE_PATTERN.search(line):
+                        raise RuntimeError("isolated BDS reported LevelDB repair or missing files")
+                    if "Server started." in line:
+                        startup_grace_deadline = self._monotonic() + 1.0
+                    continue
+                if process.poll() is not None:
+                    raise RuntimeError("isolated BDS exited before startup")
+                if (
+                    startup_grace_deadline is not None
+                    and self._monotonic() >= startup_grace_deadline
+                ):
+                    return {
+                        "validator": "isolated-bds",
+                        "result": "passed",
+                        "log_lines": len(transcript),
+                    }
+                self._sleep(0.1)
+            raise RuntimeError("isolated BDS validation timed out")
+        except Exception as error:
+            return {
+                "validator": "isolated-bds",
+                "result": "failed",
+                "reason": safe_error_label(error),
+                "log_lines": len(transcript),
+            }
+        finally:
+            if process is not None and process.poll() is None:
+                try:
+                    if process.stdin is not None:
+                        process.stdin.write("stop\n")
+                        process.stdin.flush()
+                    process.wait(timeout=15)
+                except Exception:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+            shutil.rmtree(stage, ignore_errors=True)
+
+    def _copy_runtime(self, stage: Path, snapshot: Path) -> None:
+        excluded_top_level = {"worlds"}
+        try:
+            excluded_top_level.add(
+                self.config.backup_root.relative_to(self.config.bds_root).parts[0]
+            )
+        except ValueError:
+            pass
+
+        def ignore(_directory: str, names: list[str]) -> set[str]:
+            if Path(_directory) == self.config.bds_root:
+                return excluded_top_level.intersection(names)
+            return set()
+
+        shutil.copytree(self.config.bds_root, stage, ignore=ignore, dirs_exist_ok=True)
+        shutil.copytree(snapshot / "payload" / "worlds", stage / "worlds")
+        for name in (
+            "server.properties",
+            "allowlist.json",
+            "permissions.json",
+            "valid_known_packs.json",
+        ):
+            source = snapshot / "payload" / name
+            if source.is_file():
+                shutil.copy2(source, stage / name)
+        properties = stage / "server.properties"
+        lines = properties.read_text(encoding="utf-8").splitlines()
+        overrides = {
+            "server-port": str(self.config.verification_server_port),
+            "server-portv6": str(self.config.verification_server_port + 1),
+            "online-mode": "false",
+            "allow-list": "false",
+        }
+        replaced: set[str] = set()
+        rewritten = []
+        for line in lines:
+            key, separator, _value = line.partition("=")
+            if separator and key in overrides:
+                rewritten.append(f"{key}={overrides[key]}")
+                replaced.add(key)
+            else:
+                rewritten.append(line)
+        rewritten.extend(f"{key}={value}" for key, value in overrides.items() if key not in replaced)
+        properties.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
 
 
 @contextlib.contextmanager
@@ -53,9 +209,12 @@ class SnapshotVerifier:
         self.config = config
 
     def is_owned_complete(self, path: Path) -> bool:
+        return self.is_owned_verified(path)
+
+    def is_owned_verified(self, path: Path) -> bool:
         try:
-            self.verify(path, require_current_schema=True)
-            return True
+            result = self.verify(path, require_current_schema=True)
+            return result["snapshot_state"] == "verified"
         except (OSError, UnicodeError, ValueError, RuntimeError):
             return False
 
@@ -115,6 +274,7 @@ class SnapshotVerifier:
             "schema_version": manifest["schema_version"],
             "verified_files": verified,
             "world_matches": True,
+            "snapshot_state": manifest.get("snapshot_state", "legacy"),
         }
 
     def manifest(self, path: Path) -> dict[str, object]:
@@ -143,11 +303,11 @@ class SnapshotVerifier:
         if not isinstance(manifest, dict):
             raise RuntimeError("snapshot manifest root is invalid")
         schema = manifest.get("schema_version")
-        if schema not in {1, SCHEMA_VERSION}:
+        if schema not in {1, 2, SCHEMA_VERSION}:
             raise RuntimeError("snapshot schema is unsupported")
-        if schema == SCHEMA_VERSION and manifest.get("tool") != TOOL_ID:
+        if schema in {2, SCHEMA_VERSION} and manifest.get("tool") != TOOL_ID:
             raise RuntimeError("snapshot ownership marker is invalid")
-        if schema == SCHEMA_VERSION:
+        if schema in {2, SCHEMA_VERSION}:
             owner_path = path / ".owner.json"
             if (
                 not owner_path.is_file()
@@ -162,9 +322,13 @@ class SnapshotVerifier:
             if (
                 not isinstance(owner, dict)
                 or owner.get("tool") != TOOL_ID
-                or owner.get("schema_version") != SCHEMA_VERSION
+                or owner.get("schema_version") != schema
             ):
                 raise RuntimeError("snapshot owner marker is invalid")
+        if schema == SCHEMA_VERSION:
+            state = manifest.get("snapshot_state")
+            if state not in _SNAPSHOT_STATES:
+                raise RuntimeError("snapshot state is invalid")
         if manifest.get("method") != SNAPSHOT_METHOD:
             raise RuntimeError("snapshot method marker is invalid")
         if manifest.get("world_name") != self.config.world_name:
@@ -250,27 +414,6 @@ class SnapshotRotator:
             shutil.rmtree(path)
             removed.append(path.name)
 
-        stale_before = dt.datetime.now(dt.timezone.utc).timestamp() - 24 * 60 * 60
-        for path in root.glob(".incomplete-*"):
-            try:
-                owner = path / ".owner.json"
-                if (
-                    path.is_dir()
-                    and not path.is_symlink()
-                    and owner.is_file()
-                    and not owner.is_symlink()
-                    and json.loads(owner.read_text(encoding="utf-8")).get("tool") == TOOL_ID
-                    and path.stat().st_mtime < stale_before
-                ):
-                    shutil.rmtree(path)
-            except (
-                AttributeError,
-                FileNotFoundError,
-                OSError,
-                UnicodeError,
-                json.JSONDecodeError,
-            ):
-                pass
         return removed
 
     def _head_snapshot(self, complete: list[Path]) -> Path | None:
@@ -330,6 +473,7 @@ class SnapshotManager:
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         now: Callable[[], dt.datetime] | None = None,
         token: Callable[[], str] | None = None,
+        validator: IsolatedBdsValidator | None = None,
     ):
         self.config = config
         self.console = console
@@ -338,6 +482,7 @@ class SnapshotManager:
         self._token = token or (lambda: secrets.token_hex(4))
         self.rotator = SnapshotRotator(config, token=self._token)
         self.verifier = self.rotator.verifier
+        self.validator = validator or IsolatedBdsValidator(config)
 
     def maintain(self) -> list[str]:
         return self.rotator.maintain()
@@ -345,9 +490,61 @@ class SnapshotManager:
     def create(self, reason: BackupReason) -> Path:
         self.config.snapshot_root.mkdir(parents=True, exist_ok=True, mode=0o750)
         with repository_lock(self.config):
-            return self._create_locked(reason)
+            run_started = self._timestamp()
+            before = self._snapshot_lists()
+            attempts: list[dict[str, object]] = []
+            for attempt in range(1, self.config.verification_attempts + 1):
+                try:
+                    final, details = self._create_locked(reason, attempt)
+                    attempts.append(details)
+                    removed = self._post_publish_maintenance(final)
+                    self._write_run_record(
+                        run_started, reason, before, attempts, "verified", None, removed
+                    )
+                    return final
+                except SnapshotValidationFailed as error:
+                    details = error.details or {
+                        "attempt": attempt,
+                        "snapshot_path": str(error.snapshot),
+                    }
+                    details["verification_result"] = "failed"
+                    details["failure_reason"] = safe_error_label(error.cause)
+                    details["finished_at"] = self._timestamp()
+                    attempts.append(details)
+                    if attempt == self.config.verification_attempts:
+                        self._write_run_record(
+                            run_started,
+                            reason,
+                            before,
+                            attempts,
+                            "failed",
+                            safe_error_label(error.cause),
+                            [],
+                        )
+                        raise
+                    LOGGER.warning(
+                        "Snapshot verification failed; creating an immediate retry "
+                        "(attempt=%d/%d)",
+                        attempt,
+                        self.config.verification_attempts,
+                    )
+                except Exception as error:
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "snapshot_path": None,
+                            "verification_result": "not-reached",
+                            "failure_reason": safe_error_label(error),
+                            "finished_at": self._timestamp(),
+                        }
+                    )
+                    self._write_run_record(
+                        run_started, reason, before, attempts, "failed", safe_error_label(error), []
+                    )
+                    raise
+        raise AssertionError("snapshot retry loop ended unexpectedly")
 
-    def _create_locked(self, reason: BackupReason) -> Path:
+    def _create_locked(self, reason: BackupReason, attempt: int) -> tuple[Path, dict[str, object]]:
         self.console.assert_available()
         if not self.config.world_path.is_dir():
             raise RuntimeError("configured world directory is missing")
@@ -370,10 +567,22 @@ class SnapshotManager:
         final = self.config.snapshot_root / f"{timestamp}-{self._token()}"
         if final.exists():
             raise RuntimeError("snapshot destination already exists")
-        temporary = Path(
-            tempfile.mkdtemp(prefix=f".incomplete-{timestamp}-", dir=self.config.snapshot_root)
-        )
+        temporary = Path(tempfile.mkdtemp(prefix=f".pending-{timestamp}-", dir=self.config.snapshot_root))
         published = False
+        details: dict[str, object] = {
+            "attempt": attempt,
+            "created_at": created.isoformat(),
+            "snapshot_path": str(final),
+            "save_hold_started_at": self._timestamp(),
+            "save_pause_confirmed_at": None,
+            "copy_started_at": None,
+            "copy_finished_at": None,
+            "save_resume_confirmed_at": None,
+            "file_count": None,
+            "apparent_payload_bytes": None,
+            "checksum_entries": None,
+            "verification_result": "pending",
+        }
         try:
             _write_json(
                 temporary / ".owner.json",
@@ -385,10 +594,15 @@ class SnapshotManager:
                 self.config.ready_timeout_seconds,
                 self.config.resume_timeout_seconds,
             ):
+                details["save_pause_confirmed_at"] = self._timestamp()
+                details["copy_started_at"] = self._timestamp()
                 stats = self._copy_payload(temporary, previous)
+                details["copy_finished_at"] = self._timestamp()
+            details["save_resume_confirmed_at"] = self._timestamp()
             metadata = self._validate_and_describe(
                 temporary, created, reason, stats, previous
             )
+            metadata["snapshot_state"] = "pending"
             _write_json(
                 temporary / "manifest.json",
                 metadata,
@@ -398,15 +612,52 @@ class SnapshotManager:
             _fsync_directory(temporary)
             os.rename(temporary, final)
             published = True
+            details.update(
+                {
+                    "file_count": len(metadata["checksums_sha256"]),
+                    "apparent_payload_bytes": metadata["apparent_payload_bytes"],
+                    "checksum_entries": len(metadata["checksums_sha256"]),
+                    "pending_published_at": self._timestamp(),
+                }
+            )
+            try:
+                validation = self.validator.verify(final)
+                if not isinstance(validation, dict):
+                    raise RuntimeError("isolated validator returned an invalid result")
+            except Exception as error:
+                validation = {
+                    "validator": "isolated-bds",
+                    "result": "failed",
+                    "reason": safe_error_label(error),
+                }
+                self._set_snapshot_state(final, "failed", validation)
+                raise SnapshotValidationFailed(final, error, details) from error
+            details["verification"] = validation
+            if validation.get("result") != "passed":
+                self._set_snapshot_state(final, "failed", validation)
+                raise SnapshotValidationFailed(
+                    final, RuntimeError("isolated validator rejected snapshot"), details
+                )
+            try:
+                self.verifier.verify(final, require_current_schema=True)
+            except Exception as error:
+                validation = {
+                    "validator": "post-validation-checksum",
+                    "result": "failed",
+                    "reason": safe_error_label(error),
+                }
+                self._set_snapshot_state(final, "failed", validation)
+                raise SnapshotValidationFailed(final, error, details) from error
+            self._set_snapshot_state(final, "verified", validation)
+            details["verification_result"] = "verified"
+            details["finished_at"] = self._timestamp()
+            return final, details
         except Exception:
             if not published:
                 shutil.rmtree(temporary, ignore_errors=True)
             raise
 
-        self._post_publish_maintenance(final)
-        return final
-
-    def _post_publish_maintenance(self, final: Path) -> None:
+    def _post_publish_maintenance(self, final: Path) -> list[str]:
         try:
             _fsync_directory(self.config.snapshot_root)
         except Exception as error:
@@ -415,7 +666,7 @@ class SnapshotManager:
                 "rotation was skipped",
                 safe_error_label(error),
             )
-            return
+            return []
         try:
             self.rotator._set_latest_locked(final)
         except Exception as error:
@@ -424,12 +675,13 @@ class SnapshotManager:
                 safe_error_label(error),
             )
         try:
-            self.rotator._prune_locked((final,))
+            return self.rotator._prune_locked((final,))
         except Exception as error:
             LOGGER.error(
                 "Snapshot was published but snapshot-rotation failed (%s)",
                 safe_error_label(error),
             )
+        return []
 
     def _copy_payload(self, temporary: Path, previous: Path | None) -> str:
         payload = temporary / "payload"
@@ -528,6 +780,66 @@ class SnapshotManager:
     def _latest_snapshot(self) -> Path | None:
         return self.rotator._head_snapshot(self.rotator.complete_snapshots())
 
+    def _set_snapshot_state(
+        self, snapshot: Path, state: str, validation: dict[str, object]
+    ) -> None:
+        manifest_path = snapshot / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["snapshot_state"] = state
+        manifest["validation"] = {**validation, "completed_at": self._timestamp()}
+        _replace_json(manifest_path, manifest, mode=0o640, max_bytes=_MAX_MANIFEST_BYTES)
+        _fsync_directory(snapshot)
+        _fsync_directory(self.config.snapshot_root)
+
+    def _snapshot_lists(self) -> dict[str, list[str]]:
+        result = {"verified": [], "pending": [], "failed": [], "protected_legacy": []}
+        if not self.config.snapshot_root.is_dir():
+            return result
+        for path in sorted(self.config.snapshot_root.iterdir()):
+            if not path.is_dir() or path.is_symlink():
+                continue
+            try:
+                manifest = self.verifier.manifest(path)
+                state = manifest.get("snapshot_state")
+                if state in {"pending", "failed"}:
+                    result[str(state)].append(path.name)
+                elif self.verifier.is_owned_verified(path):
+                    result["verified"].append(path.name)
+                else:
+                    result["protected_legacy"].append(path.name)
+            except (OSError, RuntimeError, UnicodeError, ValueError):
+                result["protected_legacy"].append(path.name)
+        return result
+
+    def _write_run_record(
+        self,
+        started: str,
+        reason: BackupReason,
+        before: dict[str, list[str]],
+        attempts: list[dict[str, object]],
+        result: str,
+        failure_reason: str | None,
+        removed: list[str],
+    ) -> None:
+        root = self.config.backup_root / "runs"
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+        payload = {
+            "tool": TOOL_ID,
+            "started_at": started,
+            "finished_at": self._timestamp(),
+            "reason": reason.value,
+            "result": result,
+            "failure_reason": failure_reason,
+            "attempts": attempts,
+            "before": before,
+            "after": self._snapshot_lists(),
+            "pruned_verified": removed,
+        }
+        _write_json(root / f"{started.replace(':', '').replace('+00:00', 'Z')}-{self._token()}.json", payload, mode=0o640)
+
+    def _timestamp(self) -> str:
+        return self._now().astimezone(dt.timezone.utc).isoformat()
+
 
 class SnapshotRehearsal:
     def __init__(self, config: Config):
@@ -540,6 +852,8 @@ class SnapshotRehearsal:
 
     def _run_locked(self, snapshot: Path, destination: Path) -> dict[str, object]:
         result = self.verifier.verify(snapshot, require_current_schema=True)
+        if result["snapshot_state"] != "verified":
+            raise RuntimeError("only a verified snapshot can be rehearsed")
         if destination.exists() or destination.is_symlink():
             raise RuntimeError("rehearsal destination already exists")
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
@@ -584,6 +898,8 @@ class SnapshotRestorePlanner:
 
     def _build_locked(self, snapshot: Path) -> dict[str, object]:
         verification = self.verifier.verify(snapshot, require_current_schema=True)
+        if verification["snapshot_state"] != "verified":
+            raise RuntimeError("only a verified snapshot can be restored")
         manifest_hash = SnapshotVerifier._sha256(snapshot / "manifest.json")
         current_level = self.config.world_path / "level.dat"
         current_level_hash = (
@@ -626,6 +942,29 @@ def _write_json(
         handle.flush()
         path.chmod(mode)
         os.fsync(handle.fileno())
+
+
+def _replace_json(
+    path: Path,
+    payload: dict[str, object],
+    *,
+    mode: int,
+    max_bytes: int | None = None,
+) -> None:
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if max_bytes is not None and len(encoded) > max_bytes:
+        raise RuntimeError("snapshot manifest exceeds the supported size")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_text(path: Path, payload: str, *, mode: int) -> None:

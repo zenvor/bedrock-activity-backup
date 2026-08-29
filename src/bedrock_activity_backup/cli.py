@@ -86,6 +86,25 @@ def main(argv: list[str] | None = None) -> int:
             rotator = SnapshotRotator(config)
             with repository_lock(config):
                 complete = [path.name for path in rotator.complete_snapshots()]
+                snapshot_states = {
+                    "verified": complete,
+                    "pending": [],
+                    "failed": [],
+                    "protected_legacy": [],
+                }
+                if config.snapshot_root.is_dir():
+                    for candidate in sorted(config.snapshot_root.iterdir()):
+                        if not candidate.is_dir() or candidate.is_symlink():
+                            continue
+                        try:
+                            manifest = rotator.verifier.manifest(candidate)
+                            state = manifest.get("snapshot_state")
+                            if state in {"pending", "failed"}:
+                                snapshot_states[state].append(candidate.name)
+                            elif candidate.name not in complete:
+                                snapshot_states["protected_legacy"].append(candidate.name)
+                        except (OSError, RuntimeError, UnicodeError, ValueError):
+                            snapshot_states["protected_legacy"].append(candidate.name)
                 latest = config.backup_root / "latest"
                 latest_name = None
                 if latest.is_symlink():
@@ -99,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(
                     {
                         "state": state.to_dict(),
-                        "complete_snapshots": len(complete),
+                        "verified_snapshots": len(complete),
+                        "snapshot_states": snapshot_states,
                         "latest_snapshot": latest_name,
                         "keep_snapshots": config.keep_snapshots,
                     },

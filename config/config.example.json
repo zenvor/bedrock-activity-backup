@@ -11,5 +11,8 @@
   "min_free_bytes": 5368709120,
   "ready_timeout_seconds": 30,
   "resume_timeout_seconds": 10,
-  "list_timeout_seconds": 8
+  "list_timeout_seconds": 8,
+  "verification_timeout_seconds": 90,
+  "verification_server_port": 19134,
+  "verification_attempts": 2
 }

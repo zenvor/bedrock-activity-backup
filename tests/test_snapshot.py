@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from itertools import chain, repeat
 from pathlib import Path
 from unittest.mock import patch
 
@@ -58,18 +59,41 @@ class FixtureRsync:
         (world / "level.dat").write_bytes(b"level")
         (database / "CURRENT").write_text("MANIFEST-000001\n", encoding="ascii")
         (database / "MANIFEST-000001").write_bytes(b"manifest")
+        (database / "000001.ldb").write_bytes(b"leveldb-table")
         (payload / "server.properties").write_text(
             "level-name=Test World\n", encoding="utf-8"
         )
         return subprocess.CompletedProcess(command, 0, "Total transferred file size: 42\n", "")
 
 
+class PassingValidator:
+    def verify(self, _snapshot):
+        return {"validator": "fixture", "result": "passed"}
+
+
+class RemoveLevelDbThenPassValidator:
+    def __init__(self):
+        self.calls = 0
+
+    def verify(self, snapshot):
+        self.calls += 1
+        if self.calls == 1:
+            (snapshot / "payload/worlds/Test World/db/000001.ldb").unlink()
+            return {
+                "validator": "isolated-bds-fixture",
+                "result": "failed",
+                "reason": "missing-leveldb-file",
+            }
+        return {"validator": "isolated-bds-fixture", "result": "passed"}
+
+
 class SnapshotTests(unittest.TestCase):
-    def _manager(self, base: Path, runner, *, keep=4, times=None):
+    def _manager(self, base: Path, runner, *, keep=4, times=None, validator=None):
         config = make_config(base, keep_snapshots=keep)
-        config.world_path.mkdir(parents=True)
-        config.backup_root.mkdir(parents=True)
-        values = iter(times or [dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)])
+        config.world_path.mkdir(parents=True, exist_ok=True)
+        config.backup_root.mkdir(parents=True, exist_ok=True)
+        supplied_times = times or [dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)]
+        values = chain.from_iterable(repeat(value, 32) for value in supplied_times)
         token_values = iter(f"{index:08x}" for index in range(100))
         console = FakeConsole()
         manager = SnapshotManager(
@@ -78,6 +102,7 @@ class SnapshotTests(unittest.TestCase):
             run=runner,
             now=lambda: next(values),
             token=lambda: next(token_values),
+            validator=validator or PassingValidator(),
         )
         return config, console, manager
 
@@ -91,6 +116,57 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(console.pause_entries, 1)
             self.assertEqual(console.pause_exits, 1)
             self.assertEqual((config.backup_root / "latest").resolve(), result.resolve())
+
+    def test_missing_leveldb_file_fails_then_immediate_retry_preserves_latest_verified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            initial_config, _console, initial = self._manager(
+                base,
+                FixtureRsync(),
+                keep=2,
+                times=[dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)],
+            )
+            old = initial.create(BackupReason.PERIODIC)
+            validator = RemoveLevelDbThenPassValidator()
+            config, console, manager = self._manager(
+                base,
+                FixtureRsync(),
+                keep=2,
+                times=[dt.datetime(2026, 8, 1, hour=1, tzinfo=dt.timezone.utc)],
+                validator=validator,
+            )
+            result = manager.create(BackupReason.PERIODIC)
+            failed = [
+                path
+                for path in config.snapshot_root.iterdir()
+                if path.is_dir()
+                and json.loads((path / "manifest.json").read_text(encoding="utf-8")).get("snapshot_state") == "failed"
+            ]
+            self.assertEqual(validator.calls, 2)
+            self.assertEqual(console.pause_entries, 2)
+            self.assertEqual(len(failed), 1)
+            self.assertTrue(old.exists())
+            self.assertEqual((config.backup_root / "latest").resolve(), result.resolve())
+            self.assertEqual(manager.rotator.complete_snapshots(), [old, result])
+
+    def test_rotation_counts_only_verified_and_protects_legacy_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(Path(directory), keep_snapshots=2)
+            config.snapshot_root.mkdir(parents=True)
+            verified = [
+                create_owned_snapshot(config, f"20260801T00000{index}Z-{index:08x}")
+                for index in range(3)
+            ]
+            failed = create_owned_snapshot(config, "20260801T000009Z-deadbeef")
+            failed_manifest = json.loads((failed / "manifest.json").read_text(encoding="utf-8"))
+            failed_manifest["snapshot_state"] = "failed"
+            (failed / "manifest.json").write_text(json.dumps(failed_manifest), encoding="utf-8")
+            legacy = config.snapshot_root / "20260801T000010Z-cafebabe"
+            legacy.mkdir()
+            removed = SnapshotRotator(config).prune()
+            self.assertEqual(removed, [verified[0].name])
+            self.assertTrue(failed.exists())
+            self.assertTrue(legacy.exists())
 
     def test_copy_failure_is_not_published_and_resume_still_runs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -280,7 +356,7 @@ class SnapshotTests(unittest.TestCase):
                 result = manager.create(BackupReason.PERIODIC)
             self.assertTrue(result.is_dir())
 
-    def test_repository_fsync_failure_publishes_but_skips_rotation(self):
+    def test_repository_fsync_failure_keeps_snapshot_pending_and_skips_rotation(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = FixtureRsync()
             config, _console, manager = self._manager(Path(directory), runner)
@@ -294,11 +370,8 @@ class SnapshotTests(unittest.TestCase):
             with patch(
                 "bedrock_activity_backup.snapshot._fsync_directory",
                 side_effect=fail_repository_sync,
-            ), patch.object(manager.rotator, "_prune_locked") as prune, self.assertLogs(
-                "bedrock_activity_backup.snapshot", level="ERROR"
-            ):
-                result = manager.create(BackupReason.PERIODIC)
-            self.assertTrue(result.is_dir())
+            ), patch.object(manager.rotator, "_prune_locked") as prune, self.assertRaises(OSError):
+                manager.create(BackupReason.PERIODIC)
             prune.assert_not_called()
 
     def test_maintenance_repairs_latest_from_snapshot_chain(self):

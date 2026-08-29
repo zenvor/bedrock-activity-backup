@@ -23,6 +23,9 @@ def make_config(base: Path, *, keep_snapshots: int = 4) -> Config:
         ready_timeout_seconds=30,
         resume_timeout_seconds=10,
         list_timeout_seconds=8,
+        verification_timeout_seconds=90,
+        verification_server_port=19134,
+        verification_attempts=2,
     )
     config.validate(require_managed_layout=False)
     return config
@@ -65,6 +68,7 @@ def create_owned_snapshot(
         "leveldb_manifest": "MANIFEST-000001",
         "previous_snapshot": previous,
         "checksums_sha256": checksums,
+        "snapshot_state": "verified",
     }
     (snapshot / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return snapshot

@@ -31,6 +31,9 @@ class Config:
     ready_timeout_seconds: int = 30
     resume_timeout_seconds: int = 10
     list_timeout_seconds: int = 8
+    verification_timeout_seconds: int = 90
+    verification_server_port: int = 19134
+    verification_attempts: int = 2
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -92,9 +95,14 @@ class Config:
             ("ready_timeout_seconds", self.ready_timeout_seconds),
             ("resume_timeout_seconds", self.resume_timeout_seconds),
             ("list_timeout_seconds", self.list_timeout_seconds),
+            ("verification_timeout_seconds", self.verification_timeout_seconds),
         ):
             if not 1 <= value <= 300:
                 raise ValueError(f"{label} must be between 1 and 300")
+        if not 1024 <= self.verification_server_port <= 65534:
+            raise ValueError("verification_server_port must be between 1024 and 65534")
+        if not 1 <= self.verification_attempts <= 3:
+            raise ValueError("verification_attempts must be between 1 and 3")
         if (
             self.ready_timeout_seconds
             + self.resume_timeout_seconds
