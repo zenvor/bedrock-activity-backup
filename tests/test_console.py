@@ -8,6 +8,21 @@ from bedrock_activity_backup.console import BdsConsole
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_uncertain_hold_send_still_attempts_resume(self):
+        console = BdsConsole("minecraft.service", Path("/tmp/unused"))
+        sent = []
+
+        def send(command):
+            sent.append(command)
+            if command == "save hold":
+                raise OSError("write outcome uncertain")
+
+        with patch.object(console, "_journal_cursor", return_value="cursor"), patch.object(console, "_send", side_effect=send), patch.object(console, "_wait_for"):
+            with self.assertRaises(OSError):
+                with console.paused_saves(30, 10):
+                    self.fail("copy must not start")
+        self.assertEqual(sent, ["save hold", "save resume"])
+
     class FakeClock:
         def __init__(self):
             self.value = 0.0

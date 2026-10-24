@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass
@@ -27,6 +28,10 @@ class ActivityState:
     next_due_epoch: float | None = None
     pending_reason: BackupReason | None = None
     retry_reason: BackupReason | None = None
+    consecutive_failures: int = 0
+    last_failure_reason: str | None = None
+    last_failure_epoch: float | None = None
+    last_success_epoch: float | None = None
 
     def player_connected(self, now: float, interval_seconds: int) -> bool:
         if self.phase is not Phase.IDLE:
@@ -40,7 +45,7 @@ class ActivityState:
     def player_disconnected(self, online_count: int) -> BackupReason | None:
         if online_count < 0:
             raise ValueError("online_count must not be negative")
-        if self.phase is not Phase.ACTIVE or online_count != 0:
+        if self.phase is not Phase.ACTIVE or online_count != 0 or self.retry_reason is not None:
             return None
         self.phase = Phase.BACKING_UP
         self.next_due_epoch = None
@@ -75,6 +80,10 @@ class ActivityState:
             self.pending_reason = BackupReason.RECOVERY
             self.retry_reason = None
             return self.pending_reason
+        if self.phase is Phase.ACTIVE and self.retry_reason is not None and self.next_due_epoch is not None:
+            if self.next_due_epoch > now:
+                return None
+            return self.timer_due(now)
         if online_count == 0:
             if self.phase is Phase.ACTIVE:
                 self.phase = Phase.BACKING_UP
@@ -106,6 +115,10 @@ class ActivityState:
     ) -> None:
         if self.phase is not Phase.BACKING_UP:
             raise RuntimeError("backup_succeeded requires backing_up state")
+        self.consecutive_failures = 0
+        self.last_failure_reason = None
+        self.last_failure_epoch = None
+        self.last_success_epoch = now
         self.pending_reason = None
         self.retry_reason = None
         if online_count > 0:
@@ -115,12 +128,19 @@ class ActivityState:
             self.phase = Phase.IDLE
             self.next_due_epoch = None
 
-    def backup_failed(self, now: float, retry_seconds: int) -> None:
+    def backup_failed(
+        self, now: float, retry_seconds: int, *, max_retry_seconds: int | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
         if self.phase is not Phase.BACKING_UP:
             raise RuntimeError("backup_failed requires backing_up state")
         reason = self.pending_reason or BackupReason.RECOVERY
         self.phase = Phase.ACTIVE
-        self.next_due_epoch = now + retry_seconds
+        self.consecutive_failures += 1
+        self.last_failure_epoch = now
+        self.last_failure_reason = failure_reason
+        delay = min(retry_seconds * 2 ** min(self.consecutive_failures - 1, 16), max_retry_seconds or retry_seconds)
+        self.next_due_epoch = now + delay
         self.pending_reason = None
         self.retry_reason = reason
 
@@ -152,7 +172,18 @@ class ActivityState:
             next_due_epoch=due,
             pending_reason=reason,
             retry_reason=retry,
+            consecutive_failures=raw.get("consecutive_failures", 0),
+            last_failure_reason=raw.get("last_failure_reason"),
+            last_failure_epoch=raw.get("last_failure_epoch"),
+            last_success_epoch=raw.get("last_success_epoch"),
         )
+        if type(state.consecutive_failures) is not int or state.consecutive_failures < 0:
+            raise ValueError("invalid consecutive_failures")
+        if state.last_failure_reason is not None and not isinstance(state.last_failure_reason, str):
+            raise ValueError("invalid last_failure_reason")
+        for epoch in (state.last_failure_epoch, state.last_success_epoch):
+            if epoch is not None and (type(epoch) not in (int, float) or not math.isfinite(epoch)):
+                raise ValueError("invalid backup timestamp")
         if phase is Phase.IDLE and (
             due is not None or reason is not None or retry is not None
         ):

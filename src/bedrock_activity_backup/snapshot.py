@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 
 from .config import Config
 from .console import BdsConsole
-from .errors import safe_error_label
+from .errors import DiagnosticError, safe_error_label
 from .state import BackupReason
 
 
@@ -31,6 +31,19 @@ _SNAPSHOT_PATTERN = re.compile(r"^\d{8}T\d{6}Z-[a-f0-9]{8}$")
 _MANIFEST_PATTERN = re.compile(r"^MANIFEST-\d+$")
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _SNAPSHOT_STATES = frozenset({"pending", "verified", "failed"})
+_SHUTDOWN_TIMEOUT_SECONDS = 15
+_FORCE_SHUTDOWN_TIMEOUT_SECONDS = 5
+# Only BDS runtime inputs belong in validation; deployment archives and rollback
+# folders under bds_root can be many GiB and must never be recursively copied.
+_RUNTIME_DIRECTORIES = frozenset({
+    "behavior_packs", "resource_packs", "development_behavior_packs",
+    "development_resource_packs", "development_skin_packs", "config", "data",
+    "definitions", "treatments", "minecraftpe", "premium_cache", "world_templates",
+})
+_RUNTIME_FILES = frozenset({
+    "bedrock_server", "server.properties", "allowlist.json", "permissions.json",
+    "valid_known_packs.json", "packetlimitconfig.json", "profanity_filter.wlist",
+})
 _LEVELDB_FAILURE_PATTERN = re.compile(
     r"(?:leveldb.*(?:corruption|repair)|(?:corruption|repair).*leveldb|"
     r"(?:missing|not found).{0,80}\.ldb|\.ldb.{0,80}(?:missing|not found))",
@@ -38,13 +51,13 @@ _LEVELDB_FAILURE_PATTERN = re.compile(
 )
 
 
-class SnapshotValidationFailed(RuntimeError):
+class SnapshotValidationFailed(DiagnosticError):
     """A durable snapshot failed isolated LevelDB recovery validation."""
 
     def __init__(
         self, snapshot: Path, cause: Exception, details: dict[str, object] | None = None
     ):
-        super().__init__("isolated snapshot validation failed")
+        super().__init__(f"isolated snapshot validation failed ({safe_error_label(cause)})")
         self.snapshot = snapshot
         self.cause = cause
         self.details = details
@@ -61,7 +74,7 @@ class IsolatedBdsValidator:
         self,
         config: Config,
         *,
-        popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
+        popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ):
@@ -71,87 +84,211 @@ class IsolatedBdsValidator:
         self._sleep = sleep
 
     def verify(self, snapshot: Path) -> dict[str, object]:
-        stage = Path(
-            tempfile.mkdtemp(prefix=f".verify-{snapshot.name}-", dir=self.config.backup_root)
-        )
-        transcript: list[str] = []
-        process: subprocess.Popen[str] | None = None
+        started = self._monotonic()
+        stage: Path | None = None
+        process: subprocess.Popen[bytes] | None = None
+        result: dict[str, object] = {"validator": "isolated-bds", "result": "failed", "output_complete": False}
+        # Preserve the start and tail without allowing verbose packs to exhaust RAM/disk.
+        head = bytearray()
+        tail = bytearray()
+        total_bytes = 0
+        log_lines = 0
+        scan_tail = b""
+        leveldb_failure = False
+        startup_ready = False
+        phase = "space-check"
+        phase_started = started
+        timings: dict[str, float] = {}
+
+        def next_phase(name: str) -> None:
+            nonlocal phase, phase_started
+            now = self._monotonic()
+            timings[phase] = round(now - phase_started, 3)
+            phase, phase_started = name, now
+
+        def consume(chunk: bytes) -> str:
+            nonlocal total_bytes, log_lines, scan_tail, leveldb_failure
+            total_bytes += len(chunk)
+            log_lines += chunk.count(b"\n")
+            head.extend(chunk[:max(0, 32768 - len(head))])
+            tail.extend(chunk)
+            del tail[:-32768]
+            scan = (scan_tail + chunk).decode("utf-8", errors="replace")
+            scan_tail = (scan_tail + chunk)[-512:]
+            leveldb_failure = leveldb_failure or bool(_LEVELDB_FAILURE_PATTERN.search(scan))
+            return scan
+
         try:
+            self.assert_isolated_network()
+            required = self.config.min_free_bytes + _runtime_bytes(self.config) + _apparent_bytes(snapshot / "payload")
+            _require_space(self.config, required, "validation")
+            stage = Path(tempfile.mkdtemp(prefix=f".verify-{snapshot.name}-", dir=self.config.backup_root))
+            next_phase("runtime-copy")
             self._copy_runtime(stage, snapshot)
             binary = stage / "bedrock_server"
             if not binary.is_file() or not os.access(binary, os.X_OK):
-                raise RuntimeError("isolated BDS executable is unavailable")
+                raise DiagnosticError("isolated BDS executable is unavailable")
+            next_phase("startup")
             process = self._popen(
-                [str(binary)],
-                cwd=stage,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                [str(binary)], cwd=stage, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                # Read raw pipe bytes: select + TextIO.readline can strand buffered
+                # startup lines or block forever on a partial line.
+                bufsize=0,
             )
             if process.stdout is None:
-                raise RuntimeError("isolated BDS has no log stream")
+                raise DiagnosticError("isolated BDS has no log stream")
             deadline = self._monotonic() + self.config.verification_timeout_seconds
             startup_grace_deadline: float | None = None
             while self._monotonic() < deadline:
                 ready, _unused, _errors = select.select([process.stdout], [], [], 0.1)
-                line = process.stdout.readline() if ready else ""
-                if line:
-                    transcript.append(line.rstrip())
-                    if _LEVELDB_FAILURE_PATTERN.search(line):
-                        raise RuntimeError("isolated BDS reported LevelDB repair or missing files")
-                    if "Server started." in line:
+                chunk = os.read(process.stdout.fileno(), 65536) if ready else b""
+                if chunk:
+                    scan = consume(chunk)
+                    if leveldb_failure:
+                        raise DiagnosticError("isolated BDS reported LevelDB repair or missing files")
+                    if startup_grace_deadline is None and "Server started." in scan:
                         startup_grace_deadline = self._monotonic() + 1.0
-                    continue
+                if ready and not chunk:
+                    self._sleep(0.05)
                 if process.poll() is not None:
-                    raise RuntimeError("isolated BDS exited before startup")
-                if (
-                    startup_grace_deadline is not None
-                    and self._monotonic() >= startup_grace_deadline
-                ):
-                    return {
-                        "validator": "isolated-bds",
-                        "result": "passed",
-                        "log_lines": len(transcript),
-                    }
-                self._sleep(0.1)
-            raise RuntimeError("isolated BDS validation timed out")
+                    raise DiagnosticError(f"isolated BDS exited during validation (exit={process.returncode})")
+                # Startup is only a candidate. Shutdown must still drain all queued
+                # output and confirm a clean exit before validation can pass.
+                if startup_grace_deadline is not None and self._monotonic() >= startup_grace_deadline:
+                    startup_ready = True
+                    break
+            else:
+                raise DiagnosticError("isolated BDS validation timed out")
         except Exception as error:
-            return {
-                "validator": "isolated-bds",
-                "result": "failed",
-                "reason": safe_error_label(error),
-                "log_lines": len(transcript),
-            }
+            result["reason"] = safe_error_label(error)
+            result["failed_stage"] = phase
         finally:
-            if process is not None and process.poll() is None:
-                try:
-                    if process.stdin is not None:
-                        process.stdin.write("stop\n")
+            next_phase("shutdown")
+            try:
+                if process is not None:
+                    if process.poll() is None and process.stdin is not None:
+                        process.stdin.write(b"stop\n")
                         process.stdin.flush()
-                    process.wait(timeout=15)
-                except Exception:
-                    process.terminate()
+                    if not self._drain_until_exit(process, consume, _SHUTDOWN_TIMEOUT_SECONDS):
+                        raise DiagnosticError("isolated BDS shutdown or output drain timed out")
+                    result["exit_code"] = process.returncode
+                    result["output_complete"] = True
+                    if process.returncode != 0 and "reason" not in result:
+                        raise DiagnosticError(f"isolated BDS exited during shutdown (exit={process.returncode})")
+                    if startup_ready and "reason" not in result and not leveldb_failure:
+                        result["result"] = "passed"
+            except Exception as error:
+                result.update(result="failed", shutdown_error=safe_error_label(error))
+                result.setdefault("reason", "isolated BDS shutdown failed")
+                result.setdefault("failed_stage", "shutdown")
+                # A timeout or broken pipe cannot turn a candidate into success.
+                # Continue bounded draining after terminate/kill to retain crash tails.
+                if process is not None:
+                    for action in (process.terminate, process.kill):
+                        try:
+                            if process.poll() is None:
+                                action()
+                            if self._drain_until_exit(process, consume, _FORCE_SHUTDOWN_TIMEOUT_SECONDS):
+                                result["output_complete"] = True
+                                break
+                        except Exception as cleanup_error:
+                            result["shutdown_cleanup_error"] = safe_error_label(cleanup_error)
+                            try:
+                                process.wait(timeout=_FORCE_SHUTDOWN_TIMEOUT_SECONDS)
+                            except subprocess.TimeoutExpired:
+                                continue
+                    result["exit_code"] = process.poll()
+            finally:
+                if process is not None:
+                    for stream in (process.stdin, process.stdout):
+                        if stream is not None:
+                            with contextlib.suppress(Exception):
+                                stream.close()
+                if leveldb_failure:
+                    result["result"] = "failed"
+                    result["leveldb_failure_detected"] = True
+                    result.setdefault("reason", "isolated BDS reported LevelDB repair or missing files")
+                    result.setdefault("failed_stage", "shutdown")
+                next_phase("cleanup")
+                if stage is not None and process is not None and process.poll() is None:
+                    result.update(result="failed", cleanup_error="isolated BDS is still running; staging directory preserved")
+                    result["stage_retained"] = True
+                elif stage is not None:
                     try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-            shutil.rmtree(stage, ignore_errors=True)
+                        shutil.rmtree(stage)
+                    except Exception as error:
+                        result.update(result="failed", cleanup_error=safe_error_label(error))
+                        result.setdefault("reason", "isolated BDS cleanup failed")
+                        result.setdefault("failed_stage", "cleanup")
+                next_phase("diagnostics")
+                result.update(
+                    log_lines=log_lines, log_bytes=total_bytes,
+                    log_truncated=total_bytes > 65536, stage_seconds=timings,
+                    elapsed_seconds=round(self._monotonic() - started, 3),
+                )
+                if total_bytes <= 32768:
+                    transcript = bytes(head)
+                elif total_bytes <= 65536:
+                    transcript = bytes(head) + bytes(tail)[-(total_bytes - 32768):]
+                else:
+                    transcript = bytes(head) + b"\n[output truncated; final 32768 bytes follow]\n" + bytes(tail)
+                # These private artifacts may contain world/pack information. Never
+                # forward their contents to journal, CLI output or exception labels.
+                log_path = snapshot / "validation.log"
+                try:
+                    _replace_private_log(log_path, transcript)
+                    result["log_file"] = log_path.name
+                except Exception as error:
+                    result.update(result="failed", diagnostics_error=safe_error_label(error))
+                    result.setdefault("reason", "could not persist isolated validation log")
+        return result
+
+    def _drain_until_exit(
+        self,
+        process: subprocess.Popen[bytes],
+        consume: Callable[[bytes], object],
+        timeout: float,
+    ) -> bool:
+        """Drain through EOF and reap the process, within a fixed deadline.
+
+        A child exiting does not imply its pipe is empty. Conversely, EOF does
+        not imply the child has exited. Both conditions are required.
+        """
+        if process.stdout is None:
+            raise DiagnosticError("isolated BDS has no log stream")
+        deadline = self._monotonic() + timeout
+        eof = False
+        while self._monotonic() < deadline:
+            if not eof:
+                ready, _unused, _errors = select.select(
+                    [process.stdout], [], [], min(0.1, max(0, deadline - self._monotonic()))
+                )
+                if ready:
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if chunk:
+                        consume(chunk)
+                    else:
+                        eof = True
+            else:
+                self._sleep(min(0.05, max(0, deadline - self._monotonic())))
+            if eof and process.poll() is not None:
+                return True
+        return False
+
+    def assert_isolated_network(self) -> None:
+        try:
+            current = Path("/proc/self/ns/net").stat()
+            host = Path("/proc/1/ns/net").stat()
+        except OSError as error:
+            raise DiagnosticError("could not confirm isolated validation network namespace") from error
+        if (current.st_dev, current.st_ino) == (host.st_dev, host.st_ino):
+            raise DiagnosticError("isolated validation requires a private network namespace")
 
     def _copy_runtime(self, stage: Path, snapshot: Path) -> None:
-        excluded_top_level = {"worlds"}
-        try:
-            excluded_top_level.add(
-                self.config.backup_root.relative_to(self.config.bds_root).parts[0]
-            )
-        except ValueError:
-            pass
-
         def ignore(_directory: str, names: list[str]) -> set[str]:
             if Path(_directory) == self.config.bds_root:
-                return excluded_top_level.intersection(names)
+                return _runtime_exclusions(self.config).intersection(names)
             return set()
 
         shutil.copytree(self.config.bds_root, stage, ignore=ignore, dirs_exist_ok=True)
@@ -168,10 +305,15 @@ class IsolatedBdsValidator:
         properties = stage / "server.properties"
         lines = properties.read_text(encoding="utf-8").splitlines()
         overrides = {
+            "level-name": self.config.world_name,
             "server-port": str(self.config.verification_server_port),
             "server-portv6": str(self.config.verification_server_port + 1),
             "online-mode": "false",
             "allow-list": "false",
+            "max-threads": "1",
+            "view-distance": "5",
+            "tick-distance": "4",
+            "enable-lan-visibility": "false",
         }
         replaced: set[str] = set()
         rewritten = []
@@ -194,7 +336,7 @@ def repository_lock(config: Config) -> Iterator[None]:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise RuntimeError("snapshot repository is busy") from error
+            raise DiagnosticError("snapshot repository is busy") from error
         yield
 
 
@@ -223,22 +365,22 @@ class SnapshotVerifier:
     ) -> dict[str, object]:
         manifest = self._validate_structure(path)
         if require_current_schema and manifest["schema_version"] != SCHEMA_VERSION:
-            raise RuntimeError("snapshot schema is read-only legacy data")
+            raise DiagnosticError("snapshot schema is read-only legacy data")
         checksums = manifest.get("checksums_sha256")
         if not isinstance(checksums, dict) or not checksums:
-            raise RuntimeError("snapshot manifest has no checksums")
+            raise DiagnosticError("snapshot manifest has no checksums")
         payload = path / "payload"
         if manifest["schema_version"] == SCHEMA_VERSION:
             payload_entries = list(payload.rglob("*"))
             if any(entry.is_symlink() for entry in payload_entries):
-                raise RuntimeError("snapshot payload contains a symbolic link")
+                raise DiagnosticError("snapshot payload contains a symbolic link")
             regular_files = {
                 str(entry.relative_to(path))
                 for entry in payload_entries
                 if entry.is_file()
             }
             if set(checksums) != regular_files:
-                raise RuntimeError("snapshot checksums do not cover the full payload")
+                raise DiagnosticError("snapshot checksums do not cover the full payload")
         manifest_name = str(manifest["leveldb_manifest"])
         required_checksums = {
             f"payload/worlds/{self.config.world_name}/level.dat",
@@ -247,27 +389,27 @@ class SnapshotVerifier:
             "payload/server.properties",
         }
         if not required_checksums.issubset(checksums):
-            raise RuntimeError("snapshot manifest omits a required checksum")
+            raise DiagnosticError("snapshot manifest omits a required checksum")
         verified = 0
         root = path.resolve(strict=True)
         for relative_raw, expected_raw in checksums.items():
             if not isinstance(relative_raw, str) or not isinstance(expected_raw, str):
-                raise RuntimeError("snapshot manifest contains an invalid checksum entry")
+                raise DiagnosticError("snapshot manifest contains an invalid checksum entry")
             relative = PurePosixPath(relative_raw)
             if relative.is_absolute() or ".." in relative.parts:
-                raise RuntimeError("snapshot manifest contains an unsafe relative path")
+                raise DiagnosticError("snapshot manifest contains an unsafe relative path")
             candidate = path.joinpath(*relative.parts)
             try:
                 resolved = candidate.resolve(strict=True)
                 resolved.relative_to(root)
             except (OSError, ValueError) as error:
-                raise RuntimeError("snapshot checksum path is unavailable") from error
+                raise DiagnosticError("snapshot checksum path is unavailable") from error
             if not candidate.is_file() or candidate.is_symlink():
-                raise RuntimeError("snapshot checksum target is not a regular file")
+                raise DiagnosticError("snapshot checksum target is not a regular file")
             if not re.fullmatch(r"[a-f0-9]{64}", expected_raw):
-                raise RuntimeError("snapshot manifest contains an invalid SHA-256")
+                raise DiagnosticError("snapshot manifest contains an invalid SHA-256")
             if self._sha256(candidate) != expected_raw:
-                raise RuntimeError("snapshot checksum verification failed")
+                raise DiagnosticError("snapshot checksum verification failed")
             verified += 1
         return {
             "snapshot": path.name,
@@ -288,25 +430,25 @@ class SnapshotVerifier:
             or path.parent.resolve(strict=False)
             != self.config.snapshot_root.resolve(strict=False)
         ):
-            raise RuntimeError("snapshot is not an owned repository entry")
+            raise DiagnosticError("snapshot is not an owned repository entry")
         manifest_path = path / "manifest.json"
         if (
             not manifest_path.is_file()
             or manifest_path.is_symlink()
             or manifest_path.stat().st_size > _MAX_MANIFEST_BYTES
         ):
-            raise RuntimeError("snapshot manifest is unavailable")
+            raise DiagnosticError("snapshot manifest is unavailable")
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise RuntimeError("snapshot manifest is invalid") from error
+            raise DiagnosticError("snapshot manifest is invalid") from error
         if not isinstance(manifest, dict):
-            raise RuntimeError("snapshot manifest root is invalid")
+            raise DiagnosticError("snapshot manifest root is invalid")
         schema = manifest.get("schema_version")
         if schema not in {1, 2, SCHEMA_VERSION}:
-            raise RuntimeError("snapshot schema is unsupported")
+            raise DiagnosticError("snapshot schema is unsupported")
         if schema in {2, SCHEMA_VERSION} and manifest.get("tool") != TOOL_ID:
-            raise RuntimeError("snapshot ownership marker is invalid")
+            raise DiagnosticError("snapshot ownership marker is invalid")
         if schema in {2, SCHEMA_VERSION}:
             owner_path = path / ".owner.json"
             if (
@@ -314,44 +456,44 @@ class SnapshotVerifier:
                 or owner_path.is_symlink()
                 or owner_path.stat().st_size > _MAX_MANIFEST_BYTES
             ):
-                raise RuntimeError("snapshot owner marker is unavailable")
+                raise DiagnosticError("snapshot owner marker is unavailable")
             try:
                 owner = json.loads(owner_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                raise RuntimeError("snapshot owner marker is unavailable") from error
+                raise DiagnosticError("snapshot owner marker is unavailable") from error
             if (
                 not isinstance(owner, dict)
                 or owner.get("tool") != TOOL_ID
                 or owner.get("schema_version") != schema
             ):
-                raise RuntimeError("snapshot owner marker is invalid")
+                raise DiagnosticError("snapshot owner marker is invalid")
         if schema == SCHEMA_VERSION:
             state = manifest.get("snapshot_state")
             if state not in _SNAPSHOT_STATES:
-                raise RuntimeError("snapshot state is invalid")
+                raise DiagnosticError("snapshot state is invalid")
         if manifest.get("method") != SNAPSHOT_METHOD:
-            raise RuntimeError("snapshot method marker is invalid")
+            raise DiagnosticError("snapshot method marker is invalid")
         if manifest.get("world_name") != self.config.world_name:
-            raise RuntimeError("snapshot belongs to a different world")
+            raise DiagnosticError("snapshot belongs to a different world")
         world = path / "payload" / "worlds" / self.config.world_name
         current = world / "db" / "CURRENT"
         level = world / "level.dat"
         properties = path / "payload" / "server.properties"
         for required in (current, level, properties):
             if not required.is_file() or required.is_symlink():
-                raise RuntimeError("snapshot required file is unavailable")
+                raise DiagnosticError("snapshot required file is unavailable")
         try:
             manifest_name = current.read_text(encoding="ascii").strip()
         except (OSError, UnicodeError) as error:
-            raise RuntimeError("snapshot LevelDB CURRENT is invalid") from error
+            raise DiagnosticError("snapshot LevelDB CURRENT is invalid") from error
         if (
             not _MANIFEST_PATTERN.fullmatch(manifest_name)
             or manifest.get("leveldb_manifest") != manifest_name
         ):
-            raise RuntimeError("snapshot LevelDB manifest reference is invalid")
+            raise DiagnosticError("snapshot LevelDB manifest reference is invalid")
         database_manifest = world / "db" / manifest_name
         if not database_manifest.is_file() or database_manifest.is_symlink():
-            raise RuntimeError("snapshot LevelDB manifest is unavailable")
+            raise DiagnosticError("snapshot LevelDB manifest is unavailable")
         return manifest
 
     @staticmethod
@@ -494,8 +636,12 @@ class SnapshotManager:
             before = self._snapshot_lists()
             attempts: list[dict[str, object]] = []
             for attempt in range(1, self.config.verification_attempts + 1):
+                details: dict[str, object] = {"attempt": attempt}
+                attempt_started = time.monotonic()
+                _mark_stage(details, "preflight")
                 try:
-                    final, details = self._create_locked(reason, attempt)
+                    final, details = self._create_locked(reason, attempt, details)
+                    _finish_attempt(details, attempt_started)
                     attempts.append(details)
                     removed = self._post_publish_maintenance(final)
                     self._write_run_record(
@@ -507,6 +653,7 @@ class SnapshotManager:
                         "attempt": attempt,
                         "snapshot_path": str(error.snapshot),
                     }
+                    _finish_attempt(details, attempt_started)
                     details["verification_result"] = "failed"
                     details["failure_reason"] = safe_error_label(error.cause)
                     details["finished_at"] = self._timestamp()
@@ -529,10 +676,10 @@ class SnapshotManager:
                         self.config.verification_attempts,
                     )
                 except Exception as error:
+                    _finish_attempt(details, attempt_started)
                     attempts.append(
                         {
-                            "attempt": attempt,
-                            "snapshot_path": None,
+                            **details,
                             "verification_result": "not-reached",
                             "failure_reason": safe_error_label(error),
                             "finished_at": self._timestamp(),
@@ -544,36 +691,53 @@ class SnapshotManager:
                     raise
         raise AssertionError("snapshot retry loop ended unexpectedly")
 
-    def _create_locked(self, reason: BackupReason, attempt: int) -> tuple[Path, dict[str, object]]:
+    def _create_locked(
+        self, reason: BackupReason, attempt: int, details: dict[str, object]
+    ) -> tuple[Path, dict[str, object]]:
         self.console.assert_available()
         if not self.config.world_path.is_dir():
-            raise RuntimeError("configured world directory is missing")
-        available = shutil.disk_usage(self.config.backup_root).free
-        worst_case_copy = _apparent_bytes(self.config.world_path)
-        for name in (
-            "server.properties",
-            "allowlist.json",
-            "permissions.json",
-            "valid_known_packs.json",
-        ):
+            raise DiagnosticError("configured world directory is missing")
+        if isinstance(self.validator, IsolatedBdsValidator):
+            self.validator.assert_isolated_network()
+        failed = []
+        for candidate in self.config.snapshot_root.iterdir():
+            try:
+                if self.verifier.manifest(candidate).get("snapshot_state") == "failed":
+                    failed.append(candidate)
+            except (OSError, RuntimeError, UnicodeError, ValueError):
+                continue
+        if len(failed) >= self.config.max_failed_snapshots:
+            raise DiagnosticError(
+                f"failed snapshot limit reached (count={len(failed)}, limit={self.config.max_failed_snapshots}); operator review required"
+            )
+        snapshot_bytes = _apparent_bytes(self.config.world_path)
+        for name in ("server.properties", "allowlist.json", "permissions.json", "valid_known_packs.json"):
             path = self.config.bds_root / name
             if path.is_file() and not path.is_symlink():
-                worst_case_copy += path.stat().st_size
-        if available < self.config.min_free_bytes + worst_case_copy:
-            raise RuntimeError("free disk space is below the configured safety threshold")
+                snapshot_bytes += path.stat().st_size
+        runtime_bytes = _runtime_bytes(self.config)
+        # The pending payload and a separate writable validation world coexist.
+        required = self.config.min_free_bytes + 2 * snapshot_bytes + runtime_bytes
+        details["space_budget"] = {
+            "snapshot_bytes": snapshot_bytes, "validation_world_bytes": snapshot_bytes,
+            "runtime_bytes": runtime_bytes, "reserve_bytes": self.config.min_free_bytes,
+            "required_free_bytes": required,
+            "free_bytes": shutil.disk_usage(self.config.backup_root).free,
+        }
+        _require_space(self.config, required, "snapshot")
 
         created = self._now().astimezone(dt.timezone.utc)
         timestamp = created.strftime("%Y%m%dT%H%M%SZ")
         final = self.config.snapshot_root / f"{timestamp}-{self._token()}"
         if final.exists():
-            raise RuntimeError("snapshot destination already exists")
+            raise DiagnosticError("snapshot destination already exists")
         temporary = Path(tempfile.mkdtemp(prefix=f".pending-{timestamp}-", dir=self.config.snapshot_root))
         published = False
-        details: dict[str, object] = {
+        details.update({
             "attempt": attempt,
             "created_at": created.isoformat(),
             "snapshot_path": str(final),
-            "save_hold_started_at": self._timestamp(),
+            "save_hold_started_at": None,
             "save_pause_confirmed_at": None,
             "copy_started_at": None,
             "copy_finished_at": None,
@@ -582,23 +746,29 @@ class SnapshotManager:
             "apparent_payload_bytes": None,
             "checksum_entries": None,
             "verification_result": "pending",
-        }
+        })
         try:
             _write_json(
                 temporary / ".owner.json",
                 {"tool": TOOL_ID, "schema_version": SCHEMA_VERSION},
                 mode=0o600,
             )
+            _mark_stage(details, "previous-checksums")
             previous = self._latest_snapshot()
+            _mark_stage(details, "save-hold")
+            details["save_hold_started_at"] = self._timestamp()
             with self.console.paused_saves(
                 self.config.ready_timeout_seconds,
                 self.config.resume_timeout_seconds,
             ):
                 details["save_pause_confirmed_at"] = self._timestamp()
                 details["copy_started_at"] = self._timestamp()
+                _mark_stage(details, "copy")
                 stats = self._copy_payload(temporary, previous)
+                _mark_stage(details, "save-resume")
                 details["copy_finished_at"] = self._timestamp()
             details["save_resume_confirmed_at"] = self._timestamp()
+            _mark_stage(details, "checksums")
             metadata = self._validate_and_describe(
                 temporary, created, reason, stats, previous
             )
@@ -621,24 +791,27 @@ class SnapshotManager:
                 }
             )
             try:
+                _mark_stage(details, "isolated-validation")
                 validation = self.validator.verify(final)
                 if not isinstance(validation, dict):
-                    raise RuntimeError("isolated validator returned an invalid result")
+                    raise DiagnosticError("isolated validator returned an invalid result")
             except Exception as error:
                 validation = {
                     "validator": "isolated-bds",
                     "result": "failed",
                     "reason": safe_error_label(error),
                 }
+                details["verification"] = validation
                 self._set_snapshot_state(final, "failed", validation)
                 raise SnapshotValidationFailed(final, error, details) from error
             details["verification"] = validation
             if validation.get("result") != "passed":
                 self._set_snapshot_state(final, "failed", validation)
                 raise SnapshotValidationFailed(
-                    final, RuntimeError("isolated validator rejected snapshot"), details
+                    final, DiagnosticError("isolated validator rejected snapshot; inspect validation record"), details
                 )
             try:
+                _mark_stage(details, "post-validation-checksums")
                 self.verifier.verify(final, require_current_schema=True)
             except Exception as error:
                 validation = {
@@ -646,13 +819,21 @@ class SnapshotManager:
                     "result": "failed",
                     "reason": safe_error_label(error),
                 }
+                details["verification"] = validation
                 self._set_snapshot_state(final, "failed", validation)
                 raise SnapshotValidationFailed(final, error, details) from error
             self._set_snapshot_state(final, "verified", validation)
+            _mark_stage(details, "verified")
             details["verification_result"] = "verified"
             details["finished_at"] = self._timestamp()
             return final, details
         except Exception:
+            if (
+                details["save_hold_started_at"] is not None
+                and getattr(self.console, "last_resume_confirmed", False)
+                and details["save_resume_confirmed_at"] is None
+            ):
+                details["save_resume_confirmed_at"] = self._timestamp()
             if not published:
                 shutil.rmtree(temporary, ignore_errors=True)
             raise
@@ -738,13 +919,13 @@ class SnapshotManager:
         properties = payload / "server.properties"
         for required in (current, level, properties):
             if not required.is_file() or required.is_symlink():
-                raise RuntimeError("snapshot validation failed: a required file is missing")
+                raise DiagnosticError("snapshot validation failed: a required file is missing")
         manifest_name = current.read_text(encoding="ascii").strip()
         if not _MANIFEST_PATTERN.fullmatch(manifest_name):
-            raise RuntimeError("snapshot validation failed: invalid LevelDB manifest name")
+            raise DiagnosticError("snapshot validation failed: invalid LevelDB manifest name")
         database_manifest = world / "db" / manifest_name
         if not database_manifest.is_file() or database_manifest.is_symlink():
-            raise RuntimeError("snapshot validation failed: LevelDB manifest is missing")
+            raise DiagnosticError("snapshot validation failed: LevelDB manifest is missing")
 
         checksum_paths = sorted(
             path
@@ -752,7 +933,7 @@ class SnapshotManager:
             if path.is_file() and not path.is_symlink()
         )
         if any(path.is_symlink() for path in payload.rglob("*")):
-            raise RuntimeError("snapshot validation failed: payload contains a symlink")
+            raise DiagnosticError("snapshot validation failed: payload contains a symlink")
         checksums = {
             str(path.relative_to(temporary)): SnapshotVerifier._sha256(path)
             for path in checksum_paths
@@ -853,20 +1034,20 @@ class SnapshotRehearsal:
     def _run_locked(self, snapshot: Path, destination: Path) -> dict[str, object]:
         result = self.verifier.verify(snapshot, require_current_schema=True)
         if result["snapshot_state"] != "verified":
-            raise RuntimeError("only a verified snapshot can be rehearsed")
+            raise DiagnosticError("only a verified snapshot can be rehearsed")
         if destination.exists() or destination.is_symlink():
-            raise RuntimeError("rehearsal destination already exists")
+            raise DiagnosticError("rehearsal destination already exists")
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
         required = _apparent_bytes(snapshot / "payload")
         if shutil.disk_usage(destination.parent).free < self.config.min_free_bytes + required:
-            raise RuntimeError("free disk space is below the rehearsal safety threshold")
+            raise DiagnosticError("free disk space is below the rehearsal safety threshold")
         try:
             shutil.copytree(snapshot / "payload", destination)
             world = destination / "worlds" / self.config.world_name
             current = world / "db" / "CURRENT"
             manifest_name = current.read_text(encoding="ascii").strip()
             if not (world / "db" / manifest_name).is_file():
-                raise RuntimeError("rehearsed LevelDB manifest is unavailable")
+                raise DiagnosticError("rehearsed LevelDB manifest is unavailable")
             manifest = self.verifier.manifest(snapshot)
             checksums = manifest["checksums_sha256"]
             assert isinstance(checksums, dict)
@@ -874,10 +1055,10 @@ class SnapshotRehearsal:
                 assert isinstance(relative_raw, str) and isinstance(expected_raw, str)
                 relative = PurePosixPath(relative_raw)
                 if not relative.parts or relative.parts[0] != "payload":
-                    raise RuntimeError("rehearsal checksum path is invalid")
+                    raise DiagnosticError("rehearsal checksum path is invalid")
                 copied = destination.joinpath(*relative.parts[1:])
                 if not copied.is_file() or SnapshotVerifier._sha256(copied) != expected_raw:
-                    raise RuntimeError("rehearsal checksum verification failed")
+                    raise DiagnosticError("rehearsal checksum verification failed")
             result = {**result, "rehearsal": "passed", "destination": destination.name}
             _write_json(destination / "rehearsal-report.json", result, mode=0o640)
             _fsync_tree(destination)
@@ -899,7 +1080,7 @@ class SnapshotRestorePlanner:
     def _build_locked(self, snapshot: Path) -> dict[str, object]:
         verification = self.verifier.verify(snapshot, require_current_schema=True)
         if verification["snapshot_state"] != "verified":
-            raise RuntimeError("only a verified snapshot can be restored")
+            raise DiagnosticError("only a verified snapshot can be restored")
         manifest_hash = SnapshotVerifier._sha256(snapshot / "manifest.json")
         current_level = self.config.world_path / "level.dat"
         current_level_hash = (
@@ -936,7 +1117,7 @@ def _write_json(
 ) -> None:
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if max_bytes is not None and len(encoded) > max_bytes:
-        raise RuntimeError("snapshot manifest exceeds the supported size")
+        raise DiagnosticError("snapshot manifest exceeds the supported size")
     with path.open("x", encoding="utf-8") as handle:
         handle.write(encoded.decode("utf-8"))
         handle.flush()
@@ -953,7 +1134,7 @@ def _replace_json(
 ) -> None:
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if max_bytes is not None and len(encoded) > max_bytes:
-        raise RuntimeError("snapshot manifest exceeds the supported size")
+        raise DiagnosticError("snapshot manifest exceeds the supported size")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -1007,3 +1188,75 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _runtime_exclusions(config: Config) -> set[str]:
+    excluded = {
+        entry.name for entry in config.bds_root.iterdir()
+        if entry.name not in _RUNTIME_DIRECTORIES
+        and entry.name not in _RUNTIME_FILES
+        and not (entry.name.startswith("lib") and ".so" in entry.name)
+    }
+    try:
+        excluded.add(config.backup_root.relative_to(config.bds_root).parts[0])
+    except ValueError:
+        pass
+    return excluded
+
+
+def _runtime_bytes(config: Config) -> int:
+    total = 0
+    for entry in config.bds_root.iterdir():
+        if entry.name in _runtime_exclusions(config):
+            continue
+        paths = [entry] if not entry.is_dir() else [entry, *entry.rglob("*")]
+        for path in paths:
+            # copytree would dereference these and invalidate the budget/isolation.
+            if path.is_symlink():
+                raise DiagnosticError("isolated BDS runtime contains a symbolic link")
+            if path.is_file():
+                total += path.stat().st_size
+    return total
+
+
+def _require_space(config: Config, required: int, stage: str) -> None:
+    available = shutil.disk_usage(config.backup_root).free
+    if available < required:
+        raise DiagnosticError(
+            f"free disk space is below the configured safety threshold "
+            f"(stage={stage}, free_bytes={available}, required_free_bytes={required}, "
+            f"deficit_bytes={required - available})"
+        )
+
+
+def _replace_private_log(path: Path, content: bytes) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".validation-log-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _mark_stage(details: dict[str, object], name: str) -> None:
+    now = time.monotonic()
+    previous = details.get("stage")
+    started = details.pop("_stage_started", now)
+    timings = details.setdefault("stage_seconds", {})
+    if previous is not None:
+        timings[previous] = round(now - started, 3)
+    details["stage"] = name
+    details["_stage_started"] = now
+
+
+def _finish_attempt(details: dict[str, object], started: float) -> None:
+    now = time.monotonic()
+    stage_started = details.pop("_stage_started", now)
+    stage = details.get("stage")
+    if stage is not None:
+        details.setdefault("stage_seconds", {})[stage] = round(now - stage_started, 3)
+    details["elapsed_seconds"] = round(now - started, 3)

@@ -10,6 +10,8 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+from .errors import DiagnosticError
+
 
 _PLAYER_COUNT_PATTERN = re.compile(r"There are (\d+)/(\d+) players online:")
 _READY_TO_COPY_PATTERN = re.compile(
@@ -45,6 +47,7 @@ class BdsConsole:
         self._run = run
         self._monotonic = monotonic
         self._sleep = sleep
+        self.last_resume_confirmed = False
 
     def assert_available(self) -> None:
         result = self._run(
@@ -54,13 +57,13 @@ class BdsConsole:
             timeout=10,
         )
         if result.returncode != 0 or result.stdout.strip() != "active":
-            raise RuntimeError("BDS service is not active")
+            raise DiagnosticError("BDS service is not active")
         try:
             mode = self.fifo.stat().st_mode
         except OSError as error:
-            raise RuntimeError("BDS console FIFO is unavailable") from error
+            raise DiagnosticError("BDS console FIFO is unavailable") from error
         if not stat.S_ISFIFO(mode):
-            raise RuntimeError("BDS console path is not a FIFO")
+            raise DiagnosticError("BDS console path is not a FIFO")
 
     def query_player_count(self, timeout: int) -> int:
         cursor = self._journal_cursor()
@@ -68,15 +71,16 @@ class BdsConsole:
         output = self._wait_for(_PLAYER_COUNT_PATTERN, cursor, timeout)
         match = _PLAYER_COUNT_PATTERN.search(output)
         if match is None:
-            raise RuntimeError("BDS list response could not be parsed")
+            raise DiagnosticError("BDS list response could not be parsed")
         return int(match.group(1))
 
     @contextlib.contextmanager
     def paused_saves(self, ready_timeout: int, resume_timeout: int) -> Iterator[None]:
+        self.last_resume_confirmed = False
         cursor = self._journal_cursor()
         hold_started = self._monotonic()
-        self._send("save hold")
         try:
+            self._send("save hold")
             deadline = self._monotonic() + ready_timeout
             delay = _INITIAL_SAVE_QUERY_DELAY_SECONDS
             attempts = 0
@@ -120,7 +124,7 @@ class BdsConsole:
                     )
                 delay = min(delay * 2, _MAX_SAVE_QUERY_DELAY_SECONDS)
             if not ready:
-                raise RuntimeError("BDS did not reach backup-ready state")
+                raise DiagnosticError("BDS did not reach backup-ready state")
             yield
         finally:
             try:
@@ -130,8 +134,9 @@ class BdsConsole:
             resume_started = self._monotonic()
             self._send_resume_with_retry()
             if resume_cursor is None:
-                raise RuntimeError("save resume was sent but could not be confirmed")
+                raise DiagnosticError("save resume was sent but could not be confirmed")
             self._wait_for(_SAVES_RESUMED_PATTERN, resume_cursor, resume_timeout)
+            self.last_resume_confirmed = True
             LOGGER.info(
                 "BDS save resume confirmed (elapsed_seconds=%.2f)",
                 self._monotonic() - resume_started,
@@ -152,7 +157,7 @@ class BdsConsole:
                 )
                 if attempt < _RESUME_SEND_ATTEMPTS:
                     self._sleep(_RESUME_RETRY_DELAY_SECONDS)
-        raise RuntimeError("could not send BDS save resume after retries") from last_error
+        raise DiagnosticError("could not send BDS save resume after retries") from last_error
 
     def _journal_cursor(self) -> str:
         result = self._run(
@@ -173,7 +178,7 @@ class BdsConsole:
         for line in reversed(result.stdout.splitlines()):
             if line.startswith("-- cursor: "):
                 return line.removeprefix("-- cursor: ")
-        raise RuntimeError("systemd journal cursor is unavailable")
+        raise DiagnosticError("systemd journal cursor is unavailable")
 
     def _logs_after(self, cursor: str) -> str:
         result = self._run(
@@ -202,7 +207,7 @@ class BdsConsole:
             if pattern.search(latest):
                 return latest
             self._sleep(0.25)
-        raise RuntimeError("timed out waiting for a BDS console response")
+        raise DiagnosticError("timed out waiting for a BDS console response")
 
     def _send(self, command: str) -> None:
         if "\n" in command or "\r" in command:
@@ -210,7 +215,7 @@ class BdsConsole:
         try:
             descriptor = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
         except OSError as error:
-            raise RuntimeError("could not open BDS console FIFO") from error
+            raise DiagnosticError("could not open BDS console FIFO") from error
         try:
             os.write(descriptor, f"{command}\n".encode("utf-8"))
         finally:

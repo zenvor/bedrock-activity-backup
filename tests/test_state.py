@@ -92,6 +92,23 @@ class ActivityStateTests(unittest.TestCase):
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_retry_backoff_survives_restart_and_resets_after_success(self):
+        state = ActivityState(Phase.BACKING_UP, pending_reason=BackupReason.LAST_PLAYER_LEFT)
+        now = 1000
+        for delay in (300, 600, 1200, 1800, 1800):
+            state.backup_failed(now, 300, max_retry_seconds=1800, failure_reason="disk full")
+            self.assertEqual(state.next_due_epoch, now + delay)
+            state = ActivityState.from_dict(state.to_dict())
+            self.assertIsNone(state.reconcile_startup(now, 0, 1800))
+            self.assertIsNone(state.player_disconnected(0))
+            self.assertEqual(state.timer_due(now + delay), BackupReason.LAST_PLAYER_LEFT)
+            now += delay
+        self.assertEqual(state.consecutive_failures, 5)
+        state.backup_succeeded(now, 0, 1800)
+        self.assertEqual(state.consecutive_failures, 0)
+        self.assertIsNone(state.last_failure_reason)
+        self.assertEqual(state.last_success_epoch, now)
+
     def test_round_trip_and_private_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run" / "state.json"

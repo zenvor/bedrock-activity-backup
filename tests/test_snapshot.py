@@ -30,6 +30,7 @@ class FakeConsole:
     def __init__(self):
         self.pause_entries = 0
         self.pause_exits = 0
+        self.last_resume_confirmed = False
 
     def assert_available(self):
         return None
@@ -37,10 +38,12 @@ class FakeConsole:
     @contextlib.contextmanager
     def paused_saves(self, _ready_timeout, _resume_timeout):
         self.pause_entries += 1
+        self.last_resume_confirmed = False
         try:
             yield
         finally:
             self.pause_exits += 1
+            self.last_resume_confirmed = True
 
 
 class FixtureRsync:
@@ -88,6 +91,35 @@ class RemoveLevelDbThenPassValidator:
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_failed_snapshot_cap_stops_copy_without_deleting_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, console, manager = self._manager(Path(directory), FixtureRsync())
+            for index in range(config.max_failed_snapshots):
+                snapshot = create_owned_snapshot(config, f"20260801T00000{index}Z-{index:08x}")
+                manifest_path = snapshot / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["snapshot_state"] = "failed"
+                manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(RuntimeError, "failed snapshot limit"):
+                manager.create(BackupReason.PERIODIC)
+            self.assertEqual(console.pause_entries, 0)
+            self.assertEqual(len(list(config.snapshot_root.iterdir())), config.max_failed_snapshots)
+
+    def test_space_budget_includes_runtime_and_validation_world(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, console, manager = self._manager(Path(directory), FixtureRsync())
+            (config.world_path / "level.dat").write_bytes(b"world")
+            (config.bds_root / "bedrock_server").write_bytes(b"runtime")
+            low = shutil.disk_usage(config.backup_root)._replace(free=config.min_free_bytes + 5)
+            with patch("bedrock_activity_backup.snapshot.shutil.disk_usage", return_value=low), self.assertRaisesRegex(RuntimeError, "deficit_bytes=12"):
+                manager.create(BackupReason.PERIODIC)
+            record = json.loads(next((config.backup_root / "runs").iterdir()).read_text())
+            attempt = record["attempts"][0]
+            self.assertEqual(attempt["space_budget"]["required_free_bytes"], config.min_free_bytes + 17)
+            self.assertEqual(attempt["stage"], "preflight")
+            self.assertIn("elapsed_seconds", attempt)
+            self.assertEqual(console.pause_entries, 0)
+
     def _manager(self, base: Path, runner, *, keep=4, times=None, validator=None):
         config = make_config(base, keep_snapshots=keep)
         config.world_path.mkdir(parents=True, exist_ok=True)
@@ -175,6 +207,9 @@ class SnapshotTests(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 manager.create(BackupReason.PERIODIC)
             self.assertEqual(console.pause_exits, 1)
+            run = json.loads(next((config.backup_root / "runs").iterdir()).read_text())
+            self.assertIsNotNone(run["attempts"][0]["save_resume_confirmed_at"])
+            self.assertEqual(run["attempts"][0]["stage"], "copy")
             self.assertEqual(list(config.snapshot_root.glob(".incomplete-*")), [])
             self.assertEqual(
                 [path for path in config.snapshot_root.iterdir() if path.is_dir()], []
