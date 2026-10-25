@@ -173,10 +173,15 @@ class ActivityWatcher:
         try:
             path = self.snapshots.create(reason)
         except Exception as error:
-            state.backup_failed(self.wall_clock(), self.config.retry_seconds)
+            state.backup_failed(
+                self.wall_clock(), self.config.retry_seconds,
+                max_retry_seconds=self.config.interval_seconds,
+                failure_reason=safe_error_label(error),
+            )
             self.store.save(state)
             LOGGER.error(
-                "Snapshot failed (%s); retry scheduled", safe_error_label(error)
+                "Snapshot failed (%s); consecutive_failures=%d retry_at_epoch=%.0f; operator review required if failures persist",
+                safe_error_label(error), state.consecutive_failures, state.next_due_epoch,
             )
             return
 

@@ -14,5 +14,6 @@
   "list_timeout_seconds": 8,
   "verification_timeout_seconds": 90,
   "verification_server_port": 19134,
-  "verification_attempts": 2
+  "verification_attempts": 2,
+  "max_failed_snapshots": 4
 }

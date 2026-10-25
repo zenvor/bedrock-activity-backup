@@ -22,13 +22,17 @@
 
 - 单实例文件锁避免并发备份。
 - 备份、维护和人工轮换统一使用同一把非阻塞锁。
-- 新快照先以 `pending` 状态保存完整清单和 SHA-256；只有隔离 BDS 实际加载世界、未出现 LevelDB repair/损坏/缺失 `.ldb` 迹象后才转为 `verified`、更新 `latest` 并参与轮换。
-- 验证失败会保留为 `failed`，记录原因并在同一运行中立即重试；旧 `verified` 快照在新 `verified` 成功前绝不会因轮换删除。`failed` 快照和旧版/无归属元数据目录默认保护，不会被自动清理。
+- 新快照先以 `pending` 状态保存完整清单和 SHA-256；只有隔离 BDS 实际加载世界，停止时排空日志至 EOF、确认进程以 0 正常退出，且启动及停止阶段均未出现 LevelDB repair/损坏/缺失 `.ldb` 迹象后才转为 `verified`、更新 `latest` 并参与轮换。
+- 验证失败会保留为 `failed`，记录原因并在同一运行中有限重试；旧 `verified` 快照在新 `verified` 成功前绝不会因轮换删除。`failed` 快照和旧版/无归属元数据目录默认保护，不会被自动清理。
 - 每次运行会在 `backups/automatic/runs/` 写入 JSON 审计记录，含保存暂停、复制、恢复、校验、验证、重试以及轮换前后目录列表。
-- 磁盘可用空间低于配置阈值时拒绝新快照。
+- 创建前预留两份完整世界（新快照和可写校验副本）、BDS 运行时和 `min_free_bytes` 安全余量；校验前再检查一次。硬链接节省不计入预算，不通过降低门槛绕过不足。
+- 隔离运行时只复制明确的 BDS 程序、动态库、正式/开发包目录、配置和数据目录；不复制模组归档、导入归档、隐藏暂存或回退目录。
+- 默认累计 4 份 `failed` 后拒绝再复制（`max_failed_snapshots`，范围 1–20），保留所有失败样本，等待人工审查与明确授权清理；已有失败数量超过上限时也生效。
+- 服务失败重试从 `retry_seconds` 开始指数退避，最长 `interval_seconds`；状态文件记录连续失败数、最近错误/时间及最近成功时间，`status` 可查看。重启和玩家断开不会绕过已有重试期限。
 - rsync 使用 `--fsync`，发布前同步新增文件及目录元数据。
 - `rename` 是提交点；提交后的 `latest` 或轮换故障只告警，不会重复生成快照。
-- 默认日志不输出 Gamertag、XUID 或原始连接日志。
+- 默认日志不输出 Gamertag、XUID 或原始连接日志。应用自身的固定错误可显示具体原因，外部异常仍只显示类型/退出码/errno。
+- 每份校验快照保存权限 `0600` 的 `validation.log`：判定前输出不超过 64 KiB 时完整保留，超限保留前后各 32 KiB并标记截断；原始内容可能含世界、包和路径信息，仅管理员查看，不转发到 journal。清单及运行记录保留阶段、耗时、日志字节数、退出码、输出是否排空及超时原因。正常停止/排空最多等待 15 秒；超时后标记失败，依次 terminate/kill 各最多等待 5 秒并继续收集诊断，强制停止成功也不算验证通过。
 - BDS 必须由附带的 FIFO 包装器启动，才能安全接收管理命令。
 
 `backup` 子命令创建的是 operator 快照，仍位于自动目录并参与 `verified` 轮换；升级、加模组等需要长期保留的人工里程碑必须放在自动目录之外。自动服务只拥有 `backups/automatic`，不会删除永久备份目录。
@@ -57,7 +61,7 @@ sudo bedrock-activity-backup restore-plan SNAPSHOT_NAME
 sudo bedrock-activity-backup rehearse SNAPSHOT_NAME rehearsal-label
 ```
 
-`verify` 会重算新 schema 中完整 payload 的 SHA-256 并显示快照状态。只有 `verified` 快照可用于 `restore-plan` 或 `rehearse`；旧 schema 仅保留只读 `verify` 兼容，不会成为链头、参与轮换、作为 `--link-dest` 或进入演练。自动验证会把 BDS 运行时复制到自动备份目录中的短暂隔离目录，替换其中世界后启动 BDS；该 service 使用独立网络命名空间，验证结束即删除该目录。它检测到 repair、corruption 或缺失 `.ldb` 日志即失败，而不会把“启动后自动修复”算作成功。
+`verify` 会重算新 schema 中完整 payload 的 SHA-256 并显示快照状态。只有 `verified` 快照可用于 `restore-plan` 或 `rehearse`；旧 schema 仅保留只读 `verify` 兼容，不会成为链头、参与轮换、作为 `--link-dest` 或进入演练。自动验证会把 BDS 运行时复制到自动备份目录中的短暂隔离目录，替换其中世界后启动 BDS；该 service 使用独立网络命名空间，程序在暂停保存前和启动校验前均确认网络命名空间不同于主机；手动 `backup` 也必须在独立 Linux 网络命名空间中运行。验证结束即删除临时目录，保留快照旁的私有诊断日志。校验副本强制使用配置中的世界名，避免误启动新世界；使用单工作线程、较低视距/模拟距离，service 配置低 CPU/I/O 调度权重。调度权重不是硬配额，仍需在线观察资源占用。它检测到 repair、corruption 或缺失 `.ldb` 日志即失败，而不会把“启动后自动修复”算作成功。
 
 自动快照用于世界事故回退，并不是整台 VPS 的灾难恢复包。它包含目标世界和 BDS JSON 配置，但不包含 BDS 二进制、systemd、全局包目录或异地副本。正式恢复必须遵循 [恢复原则](docs/restore.md)。
 
