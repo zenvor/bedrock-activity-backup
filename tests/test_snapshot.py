@@ -40,7 +40,12 @@ class FakeConsole:
         self.pause_entries += 1
         self.last_resume_confirmed = False
         try:
-            yield
+            yield {
+                "Test World/db/CURRENT": 16,
+                "Test World/db/MANIFEST-000001": 8,
+                "Test World/db/000001.ldb": 13,
+                "Test World/level.dat": 5,
+            }
         finally:
             self.pause_exits += 1
             self.last_resume_confirmed = True
@@ -61,7 +66,7 @@ class FixtureRsync:
         database.mkdir(parents=True)
         (world / "level.dat").write_bytes(b"level")
         (database / "CURRENT").write_text("MANIFEST-000001\n", encoding="ascii")
-        (database / "MANIFEST-000001").write_bytes(b"manifest")
+        (database / "MANIFEST-000001").write_bytes(b"manifest-appended-records")
         (database / "000001.ldb").write_bytes(b"leveldb-table")
         (payload / "server.properties").write_text(
             "level-name=Test World\n", encoding="utf-8"
@@ -91,19 +96,33 @@ class RemoveLevelDbThenPassValidator:
 
 
 class SnapshotTests(unittest.TestCase):
-    def test_failed_snapshot_cap_stops_copy_without_deleting_evidence(self):
+    def test_failed_snapshot_cap_allows_retry_without_deleting_existing_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
-            config, console, manager = self._manager(Path(directory), FixtureRsync())
+            config, console, manager = self._manager(
+                Path(directory), FixtureRsync(), validator=RemoveLevelDbThenPassValidator()
+            )
+            existing = []
             for index in range(config.max_failed_snapshots):
-                snapshot = create_owned_snapshot(config, f"20260801T00000{index}Z-{index:08x}")
+                snapshot = create_owned_snapshot(config, f"20260731T00000{index}Z-{index:08x}")
                 manifest_path = snapshot / "manifest.json"
                 manifest = json.loads(manifest_path.read_text())
                 manifest["snapshot_state"] = "failed"
                 manifest_path.write_text(json.dumps(manifest))
-            with self.assertRaisesRegex(RuntimeError, "failed snapshot limit"):
-                manager.create(BackupReason.PERIODIC)
-            self.assertEqual(console.pause_entries, 0)
-            self.assertEqual(len(list(config.snapshot_root.iterdir())), config.max_failed_snapshots)
+                existing.append((snapshot, manifest_path.read_bytes()))
+            result = manager.create(BackupReason.PERIODIC)
+            self.assertEqual(console.pause_entries, 2)
+            self.assertEqual(len(list(config.snapshot_root.iterdir())), config.max_failed_snapshots + 1)
+            for snapshot, manifest_bytes in existing:
+                self.assertEqual((snapshot / "manifest.json").read_bytes(), manifest_bytes)
+                self.assertTrue((snapshot / "payload").is_dir())
+            self.assertTrue((result / "payload").is_dir())
+            diagnostics = list((config.backup_root / "runs/failed").iterdir())
+            self.assertEqual(len(diagnostics), 1)
+            self.assertTrue((diagnostics[0] / "manifest.json").is_file())
+            self.assertFalse((diagnostics[0] / "payload").exists())
+            record = json.loads(next((config.backup_root / "runs").glob("*.json")).read_text())
+            self.assertFalse(record["attempts"][0]["failed_payload_retained"])
+            self.assertEqual(record["result"], "verified")
 
     def test_space_budget_includes_runtime_and_validation_world(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -148,6 +167,143 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(console.pause_entries, 1)
             self.assertEqual(console.pause_exits, 1)
             self.assertEqual((config.backup_root / "latest").resolve(), result.resolve())
+            self.assertEqual(
+                (result / "payload/worlds/Test World/db/MANIFEST-000001").read_bytes(),
+                b"manifest",
+            )
+            manifest = json.loads((result / "manifest.json").read_text())
+            self.assertEqual(manifest["save_query_files"]["Test World/db/MANIFEST-000001"], 8)
+            self.assertIn("--exclude=/worlds/Test World/db/***", runner.commands[0])
+
+    def test_truncating_hardlinked_candidate_preserves_previous_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = FixtureRsync()
+            config, _console, manager = self._manager(Path(directory), runner)
+            previous = create_owned_snapshot(config, "20260731T000000Z-deadbeef")
+            original = previous / "payload/worlds/Test World/db/MANIFEST-000001"
+            original_bytes = original.read_bytes()
+
+            def copy_with_shared_manifest(command, **kwargs):
+                result = runner(command, **kwargs)
+                candidate = Path(command[-1]) / "worlds/Test World/db/MANIFEST-000001"
+                candidate.unlink()
+                os.link(original, candidate)
+                return result
+
+            manager._run = copy_with_shared_manifest
+            snapshot = manager.create(BackupReason.PERIODIC)
+            candidate = snapshot / "payload/worlds/Test World/db/MANIFEST-000001"
+            self.assertEqual(candidate.read_bytes(), b"manifest")
+            self.assertEqual(original.read_bytes(), original_bytes)
+            self.assertNotEqual(candidate.stat().st_ino, original.stat().st_ino)
+            self.assertTrue(manager.verifier.is_owned_verified(previous))
+
+    def test_missing_or_short_query_file_resumes_saves_and_preserves_latest(self):
+        for failure in ("missing", "short"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                runner = FixtureRsync()
+                config, console, manager = self._manager(Path(directory), runner)
+                previous = create_owned_snapshot(config, "20260731T000000Z-deadbeef")
+                manager.rotator._set_latest_locked(previous)
+
+                def incomplete_copy(command, **kwargs):
+                    result = runner(command, **kwargs)
+                    table = Path(command[-1]) / "worlds/Test World/db/000001.ldb"
+                    if failure == "missing":
+                        table.unlink()
+                    else:
+                        table.write_bytes(b"short")
+                    return result
+
+                manager._run = incomplete_copy
+                message = "not copied" if failure == "missing" else "shorter"
+                with patch.object(manager.validator, "verify") as validate:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        manager.create(BackupReason.PERIODIC)
+                validate.assert_not_called()
+                self.assertEqual(console.pause_entries, 1)
+                self.assertEqual(console.pause_exits, 1)
+                self.assertTrue(console.last_resume_confirmed)
+                self.assertEqual(manager.rotator.complete_snapshots(), [previous])
+                self.assertEqual((config.backup_root / "latest").resolve(), previous.resolve())
+                self.assertEqual(list(config.snapshot_root.iterdir()), [previous])
+
+    @unittest.skipUnless(shutil.which("rsync"), "rsync is unavailable")
+    def test_real_rsync_filters_database_files_and_preserves_world_packs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _console, manager = self._manager(Path(directory), FixtureRsync())
+            data = {
+                "db/CURRENT": b"MANIFEST-000001\n",
+                "db/MANIFEST-000001": b"manifest",
+                "db/000001.ldb": b"immutable-table",
+                "db/000002.log": b"safe-log",
+                "level.dat": b"level",
+            }
+            for name, content in data.items():
+                source = config.world_path / name
+                source.parent.mkdir(parents=True, exist_ok=True)
+                suffix = b"later-records" if name.endswith(("MANIFEST-000001", ".log")) else b""
+                source.write_bytes(content + suffix)
+            (config.world_path / "db/999999.ldb").write_bytes(b"unlisted-table")
+            (config.world_path / "db/999999.log").write_bytes(b"unlisted-log")
+            pack = config.world_path / "behavior_packs/fixture/manifest.json"
+            pack.parent.mkdir(parents=True)
+            pack.write_text("{}")
+            (config.bds_root / "server.properties").write_text("level-name=Test World\n")
+
+            def run_selection(command, **kwargs):
+                # Exercise the actual filters with macOS openrsync; production-only
+                # GNU durability/ownership flags are covered by installation checks.
+                command = [arg for arg in command if arg not in {"--fsync", "--chown=root:root"}]
+                return subprocess.run(command, **kwargs)
+
+            manager._run = run_selection
+            candidate = Path(directory) / "candidate"
+            candidate.mkdir()
+            files = {f"Test World/{name}": len(content) for name, content in data.items()}
+            manager._copy_payload(candidate, None, files)
+            world = candidate / "payload/worlds/Test World"
+            self.assertEqual({path.name for path in (world / "db").iterdir()}, {
+                Path(name).name for name in data if name.startswith("db/")
+            })
+            for name, content in data.items():
+                self.assertEqual((world / name).read_bytes(), content)
+            self.assertTrue((world / "behavior_packs/fixture/manifest.json").is_file())
+            self.assertEqual((config.world_path / "db/000002.log").read_bytes(), b"safe-loglater-records")
+
+    def test_run_record_failure_after_verification_does_not_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, console, manager = self._manager(Path(directory), FixtureRsync())
+            with patch.object(manager, "_write_run_record", side_effect=OSError(28, "private path")) as record:
+                with self.assertLogs("bedrock_activity_backup.snapshot", level="ERROR") as logs:
+                    snapshot = manager.create(BackupReason.PERIODIC)
+            self.assertTrue(manager.verifier.is_owned_verified(snapshot))
+            self.assertEqual((config.backup_root / "latest").resolve(), snapshot.resolve())
+            self.assertEqual(console.pause_entries, 1)
+            record.assert_called_once()
+            self.assertNotIn("private path", "\n".join(logs.output))
+
+    def test_failed_diagnostics_persistence_preserves_new_payload_and_existing_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _console, manager = self._manager(Path(directory), FixtureRsync())
+            existing = []
+            for index in range(config.max_failed_snapshots):
+                snapshot = create_owned_snapshot(config, f"20260731T00000{index}Z-{index:08x}")
+                manifest_path = snapshot / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["snapshot_state"] = "failed"
+                manifest_path.write_text(json.dumps(manifest))
+                existing.append((snapshot, manifest_path.read_bytes()))
+            with patch.object(manager.validator, "verify", return_value={"result": "failed"}):
+                with patch("bedrock_activity_backup.snapshot._fsync_tree", side_effect=OSError(5, "private path")):
+                    with self.assertRaises(OSError):
+                        manager.create(BackupReason.PERIODIC)
+            current = [path for path in config.snapshot_root.iterdir() if path not in {p for p, _ in existing}]
+            self.assertEqual(len(current), 1)
+            self.assertTrue((current[0] / "payload").is_dir())
+            for snapshot, manifest_bytes in existing:
+                self.assertTrue((snapshot / "payload").is_dir())
+                self.assertEqual((snapshot / "manifest.json").read_bytes(), manifest_bytes)
 
     def test_missing_leveldb_file_fails_then_immediate_retry_preserves_latest_verified(self):
         with tempfile.TemporaryDirectory() as directory:
