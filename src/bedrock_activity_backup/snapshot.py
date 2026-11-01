@@ -908,30 +908,36 @@ class SnapshotManager:
         ]
         if previous is not None:
             command.append(f"--link-dest={previous / 'payload'}")
-        command.extend(
-            [
-                "--include=/worlds/",
-                f"--include=/worlds/{self.config.world_name}/",
-                f"--include=/worlds/{self.config.world_name}/db/",
-                *(f"--include=/worlds/{name}" for name in save_files),
-                f"--exclude=/worlds/{self.config.world_name}/db/***",
-                f"--include=/worlds/{self.config.world_name}/***",
-                "--include=/server.properties",
-                "--include=/allowlist.json",
-                "--include=/permissions.json",
-                "--include=/valid_known_packs.json",
-                "--exclude=*",
-                f"{self.config.bds_root}/",
-                f"{payload}/",
-            ]
-        )
-        result = self._run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        filters = [
+            "+ /worlds/",
+            f"+ /worlds/{self.config.world_name}/",
+            f"+ /worlds/{self.config.world_name}/db/",
+            *(f"+ /worlds/{name}" for name in save_files),
+            f"- /worlds/{self.config.world_name}/db/***",
+            f"+ /worlds/{self.config.world_name}/***",
+            "+ /server.properties",
+            "+ /allowlist.json",
+            "+ /permissions.json",
+            "+ /valid_known_packs.json",
+            "- *",
+        ]
+        filter_path = temporary / "rsync-filter.txt"
+        _write_text(filter_path, "\n".join(filters) + "\n", mode=0o600)
+        command.extend([
+            f"--filter=merge {filter_path}",
+            f"{self.config.bds_root}/",
+            f"{payload}/",
+        ])
+        try:
+            result = self._run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        finally:
+            filter_path.unlink(missing_ok=True)
         for name, expected_size in save_files.items():
             path = payload / "worlds" / name
             if path.is_symlink() or not path.is_file():

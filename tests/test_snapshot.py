@@ -55,9 +55,12 @@ class FixtureRsync:
     def __init__(self, fail=False):
         self.fail = fail
         self.commands = []
+        self.filters = []
 
     def __call__(self, command, **_kwargs):
         self.commands.append(command)
+        filter_path = next(arg.removeprefix("--filter=merge ") for arg in command if arg.startswith("--filter=merge "))
+        self.filters.append(Path(filter_path).read_text())
         if self.fail:
             raise subprocess.CalledProcessError(23, command)
         payload = Path(command[-1].removesuffix("/"))
@@ -173,7 +176,28 @@ class SnapshotTests(unittest.TestCase):
             )
             manifest = json.loads((result / "manifest.json").read_text())
             self.assertEqual(manifest["save_query_files"]["Test World/db/MANIFEST-000001"], 8)
-            self.assertIn("--exclude=/worlds/Test World/db/***", runner.commands[0])
+            self.assertIn("- /worlds/Test World/db/***", runner.filters[0].splitlines())
+
+    def test_large_file_list_uses_a_rule_file_instead_of_growing_argv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _console, manager = self._manager(Path(directory), FixtureRsync())
+            files = {f"Test World/db/{index:06d}.ldb": 123456 for index in range(50000)}
+            candidate = Path(directory) / "candidate"
+            candidate.mkdir()
+
+            def inspect(command, **_kwargs):
+                self.assertLess(sum(len(arg.encode()) + 1 for arg in command), 8192)
+                filter_path = Path(next(arg.removeprefix("--filter=merge ") for arg in command if arg.startswith("--filter=merge ")))
+                rules = filter_path.read_text().splitlines()
+                self.assertEqual([rule for rule in rules if rule.endswith(".ldb")], [f"+ /worlds/{name}" for name in files])
+                self.assertLess(rules.index("+ /worlds/Test World/db/049999.ldb"), rules.index("- /worlds/Test World/db/***"))
+                self.assertEqual(filter_path.stat().st_mode & 0o777, 0o600)
+                raise subprocess.CalledProcessError(23, command)
+
+            manager._run = inspect
+            with self.assertRaises(subprocess.CalledProcessError):
+                manager._copy_payload(candidate, None, files)
+            self.assertFalse((candidate / "rsync-filter.txt").exists())
 
     def test_truncating_hardlinked_candidate_preserves_previous_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
