@@ -644,9 +644,15 @@ class SnapshotManager:
                     _finish_attempt(details, attempt_started)
                     attempts.append(details)
                     removed = self._post_publish_maintenance(final)
-                    self._write_run_record(
-                        run_started, reason, before, attempts, "verified", None, removed
-                    )
+                    try:
+                        self._write_run_record(
+                            run_started, reason, before, attempts, "verified", None, removed
+                        )
+                    except Exception as error:
+                        LOGGER.error(
+                            "Snapshot is verified but run-record write failed (%s)",
+                            safe_error_label(error),
+                        )
                     return final
                 except SnapshotValidationFailed as error:
                     details = error.details or {
@@ -706,10 +712,7 @@ class SnapshotManager:
                     failed.append(candidate)
             except (OSError, RuntimeError, UnicodeError, ValueError):
                 continue
-        if len(failed) >= self.config.max_failed_snapshots:
-            raise DiagnosticError(
-                f"failed snapshot limit reached (count={len(failed)}, limit={self.config.max_failed_snapshots}); operator review required"
-            )
+        details["retain_failed_payload"] = len(failed) < self.config.max_failed_snapshots
         snapshot_bytes = _apparent_bytes(self.config.world_path)
         for name in ("server.properties", "allowlist.json", "permissions.json", "valid_known_packs.json"):
             path = self.config.bds_root / name
@@ -760,11 +763,13 @@ class SnapshotManager:
             with self.console.paused_saves(
                 self.config.ready_timeout_seconds,
                 self.config.resume_timeout_seconds,
-            ):
+            ) as save_files:
                 details["save_pause_confirmed_at"] = self._timestamp()
+                self._validate_save_files(save_files)
+                details["save_query_files"] = len(save_files)
                 details["copy_started_at"] = self._timestamp()
                 _mark_stage(details, "copy")
-                stats = self._copy_payload(temporary, previous)
+                stats = self._copy_payload(temporary, previous, save_files)
                 _mark_stage(details, "save-resume")
                 details["copy_finished_at"] = self._timestamp()
             details["save_resume_confirmed_at"] = self._timestamp()
@@ -773,6 +778,7 @@ class SnapshotManager:
                 temporary, created, reason, stats, previous
             )
             metadata["snapshot_state"] = "pending"
+            metadata["save_query_files"] = save_files
             _write_json(
                 temporary / "manifest.json",
                 metadata,
@@ -802,11 +808,11 @@ class SnapshotManager:
                     "reason": safe_error_label(error),
                 }
                 details["verification"] = validation
-                self._set_snapshot_state(final, "failed", validation)
+                self._record_failed_snapshot(final, validation, details)
                 raise SnapshotValidationFailed(final, error, details) from error
             details["verification"] = validation
             if validation.get("result") != "passed":
-                self._set_snapshot_state(final, "failed", validation)
+                self._record_failed_snapshot(final, validation, details)
                 raise SnapshotValidationFailed(
                     final, DiagnosticError("isolated validator rejected snapshot; inspect validation record"), details
                 )
@@ -820,7 +826,7 @@ class SnapshotManager:
                     "reason": safe_error_label(error),
                 }
                 details["verification"] = validation
-                self._set_snapshot_state(final, "failed", validation)
+                self._record_failed_snapshot(final, validation, details)
                 raise SnapshotValidationFailed(final, error, details) from error
             self._set_snapshot_state(final, "verified", validation)
             _mark_stage(details, "verified")
@@ -864,7 +870,30 @@ class SnapshotManager:
             )
         return []
 
-    def _copy_payload(self, temporary: Path, previous: Path | None) -> str:
+    def _validate_save_files(self, files: dict[str, int]) -> None:
+        if not isinstance(files, dict) or not files:
+            raise DiagnosticError("BDS save query returned no file list")
+        for name, size in files.items():
+            path = PurePosixPath(name)
+            if (
+                path.is_absolute() or ".." in path.parts
+                or len(path.parts) < 2 or path.parts[0] != self.config.world_name
+                or path.as_posix() != name or re.search(r"[?*\[\\\r\n\0]", name)
+                or not isinstance(size, int) or size < 0
+            ):
+                raise DiagnosticError("BDS save query returned an invalid file entry")
+        required = {f"{self.config.world_name}/db/CURRENT", f"{self.config.world_name}/level.dat"}
+        manifests = [
+            name for name in files
+            if PurePosixPath(name).parent == PurePosixPath(self.config.world_name, "db")
+            and _MANIFEST_PATTERN.fullmatch(PurePosixPath(name).name)
+        ]
+        if not required.issubset(files) or not manifests:
+            raise DiagnosticError("BDS save query omitted required world files")
+
+    def _copy_payload(
+        self, temporary: Path, previous: Path | None, save_files: dict[str, int]
+    ) -> str:
         payload = temporary / "payload"
         payload.mkdir(mode=0o750)
         command = [
@@ -879,27 +908,65 @@ class SnapshotManager:
         ]
         if previous is not None:
             command.append(f"--link-dest={previous / 'payload'}")
-        command.extend(
-            [
-                "--include=/worlds/",
-                f"--include=/worlds/{self.config.world_name}/",
-                f"--include=/worlds/{self.config.world_name}/***",
-                "--include=/server.properties",
-                "--include=/allowlist.json",
-                "--include=/permissions.json",
-                "--include=/valid_known_packs.json",
-                "--exclude=*",
-                f"{self.config.bds_root}/",
-                f"{payload}/",
-            ]
-        )
-        result = self._run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        filters = [
+            "+ /worlds/",
+            f"+ /worlds/{self.config.world_name}/",
+            f"+ /worlds/{self.config.world_name}/db/",
+            *(f"+ /worlds/{name}" for name in save_files),
+            f"- /worlds/{self.config.world_name}/db/***",
+            f"+ /worlds/{self.config.world_name}/***",
+            "+ /server.properties",
+            "+ /allowlist.json",
+            "+ /permissions.json",
+            "+ /valid_known_packs.json",
+            "- *",
+        ]
+        filter_path = temporary / "rsync-filter.txt"
+        _write_text(filter_path, "\n".join(filters) + "\n", mode=0o600)
+        command.extend([
+            f"--filter=merge {filter_path}",
+            f"{self.config.bds_root}/",
+            f"{payload}/",
+        ])
+        try:
+            result = self._run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        finally:
+            filter_path.unlink(missing_ok=True)
+        if any(path.is_symlink() for path in payload.rglob("*")):
+            raise DiagnosticError("snapshot validation failed: payload contains a symlink")
+        for name, expected_size in save_files.items():
+            path = payload / "worlds" / name
+            if path.is_symlink() or not path.is_file():
+                raise DiagnosticError("a save-query file was not copied")
+            size = path.stat().st_size
+            if size < expected_size:
+                raise DiagnosticError("a copied save-query file is shorter than its snapshot length")
+            if size > expected_size:
+                # rsync may share this inode with a verified snapshot. Replace the
+                # candidate's file with a private prefix; never truncate a shared inode.
+                descriptor, name = tempfile.mkstemp(prefix=".save-prefix-", dir=path.parent)
+                prefix = Path(name)
+                try:
+                    with os.fdopen(descriptor, "wb") as target, path.open("rb") as source:
+                        remaining = expected_size
+                        while remaining:
+                            chunk = source.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise DiagnosticError("a save-query file ended before its snapshot length")
+                            target.write(chunk)
+                            remaining -= len(chunk)
+                        target.flush()
+                        os.fchmod(target.fileno(), 0o640)
+                        os.fsync(target.fileno())
+                    os.replace(prefix, path)
+                finally:
+                    prefix.unlink(missing_ok=True)
         _write_text(temporary / "rsync-stats.txt", result.stdout, mode=0o640)
         _fsync_tree_directories(payload)
         return result.stdout
@@ -971,6 +1038,32 @@ class SnapshotManager:
         _replace_json(manifest_path, manifest, mode=0o640, max_bytes=_MAX_MANIFEST_BYTES)
         _fsync_directory(snapshot)
         _fsync_directory(self.config.snapshot_root)
+
+    def _record_failed_snapshot(
+        self, snapshot: Path, validation: dict[str, object], details: dict[str, object]
+    ) -> None:
+        self._set_snapshot_state(snapshot, "failed", validation)
+        details["failed_payload_retained"] = True
+        if details["retain_failed_payload"]:
+            return
+        diagnostics_root = self.config.backup_root / "runs" / "failed"
+        diagnostics_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = diagnostics_root / snapshot.name
+        destination.mkdir(mode=0o700)
+        for name in ("manifest.json", ".owner.json", "validation.log", "rsync-stats.txt"):
+            source = snapshot / name
+            if source.is_file():
+                target = destination / name
+                shutil.copy2(source, target)
+                target.chmod(0o600)
+        _fsync_tree(destination)
+        _fsync_directory(diagnostics_root)
+        _fsync_directory(diagnostics_root.parent)
+        _fsync_directory(self.config.backup_root)
+        details["diagnostics_path"] = str(destination)
+        shutil.rmtree(snapshot)
+        _fsync_directory(self.config.snapshot_root)
+        details["failed_payload_retained"] = False
 
     def _snapshot_lists(self) -> dict[str, list[str]]:
         result = {"verified": [], "pending": [], "failed": [], "protected_legacy": []}

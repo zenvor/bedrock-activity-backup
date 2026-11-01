@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import re
@@ -75,7 +76,7 @@ class BdsConsole:
         return int(match.group(1))
 
     @contextlib.contextmanager
-    def paused_saves(self, ready_timeout: int, resume_timeout: int) -> Iterator[None]:
+    def paused_saves(self, ready_timeout: int, resume_timeout: int) -> Iterator[dict[str, int]]:
         self.last_resume_confirmed = False
         cursor = self._journal_cursor()
         hold_started = self._monotonic()
@@ -85,6 +86,7 @@ class BdsConsole:
             delay = _INITIAL_SAVE_QUERY_DELAY_SECONDS
             attempts = 0
             ready = False
+            files: dict[str, int] | None = None
             while self._monotonic() < deadline:
                 remaining = deadline - self._monotonic()
                 if attempts == 0 and remaining <= delay:
@@ -99,7 +101,8 @@ class BdsConsole:
                 self._send("save query")
                 attempts += 1
                 output = self._logs_after(cursor)
-                if _READY_TO_COPY_PATTERN.search(output):
+                files = self._save_query_files(output)
+                if files is not None:
                     LOGGER.info(
                         "BDS save is ready for copying (query_attempts=%d elapsed_seconds=%.2f)",
                         attempts,
@@ -125,7 +128,8 @@ class BdsConsole:
                 delay = min(delay * 2, _MAX_SAVE_QUERY_DELAY_SECONDS)
             if not ready:
                 raise DiagnosticError("BDS did not reach backup-ready state")
-            yield
+            assert files is not None
+            yield files
         finally:
             try:
                 resume_cursor = self._journal_cursor()
@@ -141,6 +145,27 @@ class BdsConsole:
                 "BDS save resume confirmed (elapsed_seconds=%.2f)",
                 self._monotonic() - resume_started,
             )
+
+    @staticmethod
+    def _save_query_files(output: str) -> dict[str, int] | None:
+        responses = list(_READY_TO_COPY_PATTERN.finditer(output))
+        if not responses:
+            return None
+        ready = responses[-1]
+        for line in output[ready.end():].splitlines():
+            if not line or line.startswith("["):
+                continue
+            entries = re.split(r":([0-9]+)(?:, |$)", line)
+            if len(entries) < 3 or entries[-1] != "":
+                return None
+            files: dict[str, int] = {}
+            for index in range(0, len(entries) - 1, 2):
+                name = entries[index]
+                if not name or name in files:
+                    raise DiagnosticError("BDS save query returned an invalid file list")
+                files[name] = int(entries[index + 1])
+            return files
+        return None
 
     def _send_resume_with_retry(self) -> None:
         last_error: Exception | None = None
@@ -189,7 +214,8 @@ class BdsConsole:
                 "--after-cursor",
                 cursor,
                 "-o",
-                "cat",
+                "json",
+                "--all",
                 "--no-pager",
             ],
             check=True,
@@ -197,7 +223,41 @@ class BdsConsole:
             text=True,
             timeout=10,
         )
-        return result.stdout
+        return self._join_journal_records(result.stdout)
+
+    @staticmethod
+    def _join_journal_records(output: str) -> str:
+        lines: list[str | None] = []
+        pending: dict[str, tuple[int, bytearray]] = {}
+        for raw in output.splitlines():
+            try:
+                record = json.loads(raw)
+                message = record["MESSAGE"]
+                if isinstance(message, str):
+                    chunk = message.encode("utf-8")
+                elif isinstance(message, list) and all(type(value) is int for value in message):
+                    chunk = bytes(message)
+                else:
+                    raise ValueError("invalid message")
+                stream = record.get("_STREAM_ID")
+                if stream is not None and not isinstance(stream, str):
+                    raise ValueError("invalid stream")
+            except (KeyError, TypeError, ValueError) as error:
+                raise DiagnosticError("BDS journal returned an invalid record") from error
+            index, content = pending.pop(stream, (len(lines), bytearray()))
+            if index == len(lines):
+                lines.append(None)
+            content.extend(chunk)
+            line_break = record.get("_LINE_BREAK")
+            if line_break == "line-max":
+                if stream is None:
+                    raise DiagnosticError("BDS journal continuation has no stream identifier")
+                # Keep the first fragment's position and decode only after the final
+                # newline: other streams can interleave and UTF-8 can split mid-byte.
+                pending[stream] = (index, content)
+            elif line_break is None:
+                lines[index] = content.decode("utf-8", errors="replace")
+        return "\n".join(line for line in lines if line is not None)
 
     def _wait_for(self, pattern: re.Pattern[str], cursor: str, timeout: int) -> str:
         deadline = self._monotonic() + timeout
