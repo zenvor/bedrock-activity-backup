@@ -222,6 +222,39 @@ class SnapshotTests(unittest.TestCase):
             self.assertNotEqual(candidate.stat().st_ino, original.stat().st_ino)
             self.assertTrue(manager.verifier.is_owned_verified(previous))
 
+    def test_symlinked_query_parent_cannot_modify_a_verified_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = FixtureRsync()
+            config, console, manager = self._manager(Path(directory), runner)
+            previous = create_owned_snapshot(config, "20260731T000000Z-deadbeef")
+            original = previous / "payload/worlds/Test World/db/MANIFEST-000001"
+            original_bytes = original.read_bytes()
+            manager.rotator._set_latest_locked(previous)
+            paused_saves = console.paused_saves
+
+            @contextlib.contextmanager
+            def redirected_query(ready_timeout, resume_timeout):
+                with paused_saves(ready_timeout, resume_timeout) as files:
+                    target = f"Test World/redirect/snapshots/{previous.name}/payload/worlds/Test World/db/MANIFEST-000001"
+                    yield {**files, target: 8}
+
+            def copy_with_redirect(command, **kwargs):
+                result = runner(command, **kwargs)
+                redirect = Path(command[-1]) / "worlds/Test World/redirect"
+                redirect.symlink_to(config.backup_root, target_is_directory=True)
+                return result
+
+            console.paused_saves = redirected_query
+            manager._run = copy_with_redirect
+            with patch.object(manager.validator, "verify") as validate:
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    manager.create(BackupReason.PERIODIC)
+            validate.assert_not_called()
+            self.assertEqual(original.read_bytes(), original_bytes)
+            self.assertTrue(manager.verifier.is_owned_verified(previous))
+            self.assertEqual((config.backup_root / "latest").resolve(), previous.resolve())
+            self.assertEqual(console.pause_exits, 1)
+
     def test_missing_or_short_query_file_resumes_saves_and_preserves_latest(self):
         for failure in ("missing", "short"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:

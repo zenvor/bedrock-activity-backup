@@ -938,6 +938,8 @@ class SnapshotManager:
             )
         finally:
             filter_path.unlink(missing_ok=True)
+        if any(path.is_symlink() for path in payload.rglob("*")):
+            raise DiagnosticError("snapshot validation failed: payload contains a symlink")
         for name, expected_size in save_files.items():
             path = payload / "worlds" / name
             if path.is_symlink() or not path.is_file():
